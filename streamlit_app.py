@@ -5,7 +5,7 @@ from datetime import datetime, date
 
 import streamlit as st
 import psycopg
-from psycopg2.extras import RealDictCursor
+from psycopg.extras import RealDictCursor
 from passlib.context import CryptContext
 
 # =========================
@@ -92,7 +92,7 @@ def get_db_url() -> str:
 
 @st.cache_resource
 def db_connect():
-    return psycopg2.connect(get_db_url())
+    return psycopg.connect(get_db_url())
 
 def db_fetchone(sql: str, params=None):
     conn = db_connect()
