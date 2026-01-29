@@ -1,4 +1,6 @@
 import os
+import io
+import csv
 from datetime import datetime, date
 
 import streamlit as st
@@ -7,28 +9,25 @@ from psycopg2.extras import RealDictCursor
 from passlib.context import CryptContext
 
 # =========================
-# CONFIG GENERAL
+# CONFIG
 # =========================
 APP_TITLE = "🛠️ KR_TGM • Mantenciones e Historial"
-
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 ESTADOS_MAQUINA = ["Operativa", "Fuera de Servicio", "En Mantención", "En Prueba", "Baja", "Otro"]
 TIPOS_MANTENCION = ["Preventiva", "Correctiva", "Inspección", "Otro"]
 
-# =========================
-# ESTILO (MÁS VISUAL)
-# =========================
 st.set_page_config(page_title="KR_TGM", page_icon="🛠️", layout="wide")
 
+# =========================
+# STYLE (MENÚ VISUAL + SIN DEBUG)
+# =========================
 st.markdown(
     """
 <style>
-/* Sidebar ancho y limpio */
 section[data-testid="stSidebar"] { background: #0f1117; }
 section[data-testid="stSidebar"] .block-container { padding-top: 1.0rem; }
 
-/* Tarjeta usuario */
 .kr-usercard {
   border: 1px solid rgba(255,255,255,0.10);
   background: rgba(255,255,255,0.05);
@@ -38,8 +37,8 @@ section[data-testid="stSidebar"] .block-container { padding-top: 1.0rem; }
 }
 .kr-usercard b { font-size: 0.95rem; }
 
-/* Menú botones */
 .kr-nav-title { color: rgba(255,255,255,0.75); font-size: 0.9rem; margin-top: 8px; margin-bottom: 6px; }
+
 .kr-navbtn button {
   width: 100%;
   text-align: left;
@@ -62,7 +61,6 @@ section[data-testid="stSidebar"] .block-container { padding-top: 1.0rem; }
   font-weight: 800 !important;
 }
 
-/* Botón cerrar sesión */
 .kr-logout button {
   width: 100%;
   border-radius: 12px !important;
@@ -70,11 +68,8 @@ section[data-testid="stSidebar"] .block-container { padding-top: 1.0rem; }
   background: rgba(255,70,70,0.16) !important;
   border: 1px solid rgba(255,70,70,0.30) !important;
 }
-.kr-logout button:hover {
-  background: rgba(255,70,70,0.22) !important;
-}
+.kr-logout button:hover { background: rgba(255,70,70,0.22) !important; }
 
-/* Títulos */
 h1, h2, h3 { letter-spacing: 0.2px; }
 </style>
 """,
@@ -82,26 +77,22 @@ h1, h2, h3 { letter-spacing: 0.2px; }
 )
 
 # =========================
-# DB HELPERS
+# SECRETS / DB
 # =========================
 def get_secret(key: str, default=None):
-    if "secrets" in dir(st) and key in st.secrets:
+    if key in st.secrets:
         return st.secrets.get(key)
     return os.environ.get(key, default)
-
 
 def get_db_url() -> str:
     db_url = get_secret("DB_URL")
     if not db_url:
-        raise RuntimeError("Falta DB_URL en Secrets de Streamlit Cloud.")
+        raise RuntimeError("Falta DB_URL en Secrets.")
     return db_url
-
 
 @st.cache_resource
 def db_connect():
-    # conexión simple (Streamlit Cloud)
     return psycopg2.connect(get_db_url())
-
 
 def db_fetchone(sql: str, params=None):
     conn = db_connect()
@@ -109,20 +100,17 @@ def db_fetchone(sql: str, params=None):
         cur.execute(sql, params or ())
         return cur.fetchone()
 
-
 def db_fetchall(sql: str, params=None):
     conn = db_connect()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(sql, params or ())
         return cur.fetchall()
 
-
 def db_execute(sql: str, params=None):
     conn = db_connect()
     with conn.cursor() as cur:
         cur.execute(sql, params or ())
     conn.commit()
-
 
 def tables_exist() -> bool:
     try:
@@ -138,31 +126,25 @@ def tables_exist() -> bool:
     except Exception:
         return False
 
-
 # =========================
 # AUTH
 # =========================
 def is_logged_in() -> bool:
     return bool(st.session_state.get("user"))
 
-
 def current_user():
     return st.session_state.get("user")
-
 
 def logout():
     st.session_state["user"] = None
     st.session_state["page"] = "Login"
     st.rerun()
 
-
 def verify_password(plain: str, password_hash: str) -> bool:
-    # bcrypt hash típico: $2a$ / $2b$ ...
     try:
         return pwd_context.verify(plain, password_hash)
     except Exception:
         return False
-
 
 def login_user(username: str, password: str):
     u = db_fetchone(
@@ -171,10 +153,8 @@ def login_user(username: str, password: str):
     )
     if not u or not u.get("is_active"):
         return False, "Usuario no existe o está desactivado."
-
     if not verify_password(password, u["password_hash"]):
         return False, "Contraseña incorrecta."
-
     st.session_state["user"] = {
         "id": u["id"],
         "username": u["username"],
@@ -183,14 +163,12 @@ def login_user(username: str, password: str):
     }
     return True, None
 
-
 def require_admin():
     u = current_user()
     return bool(u and u.get("role") == "admin")
 
-
 # =========================
-# UI COMPONENTS
+# SIDEBAR NAV
 # =========================
 def nav_button(label: str, page_name: str, icon: str):
     selected = st.session_state.get("page", "Login") == page_name
@@ -201,14 +179,11 @@ def nav_button(label: str, page_name: str, icon: str):
         st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
-
 def render_sidebar():
     with st.sidebar:
         st.markdown("### Navegación")
 
-        # DB check sin debug
-        ok = tables_exist()
-        if not ok:
+        if not tables_exist():
             st.error("No se pudo verificar DB/tablas. Revisa DB_URL / conexión.")
 
         u = current_user()
@@ -222,28 +197,48 @@ def render_sidebar():
 """,
                 unsafe_allow_html=True,
             )
-
             st.markdown('<div class="kr-logout">', unsafe_allow_html=True)
             if st.button("🚪 Cerrar sesión", use_container_width=True):
                 logout()
             st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown('<div class="kr-nav-title">Ir a:</div>', unsafe_allow_html=True)
-
-        # Menú
         nav_button("Login", "Login", "🔐")
         nav_button("Máquinas", "Máquinas", "🖥️")
         nav_button("Registrar Mantención", "Registrar", "📝")
         nav_button("Historial", "Historial", "📚")
         nav_button("Usuarios", "Usuarios", "👥")
 
+# =========================
+# UTIL: CSV
+# =========================
+MACHINE_COLS = ["id_maquina", "serie", "fabricante", "modelo", "juego", "sector", "banco", "estado", "notas"]
+
+def machines_to_csv(rows):
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=MACHINE_COLS)
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({k: r.get(k, "") for k in MACHINE_COLS})
+    return output.getvalue().encode("utf-8")
+
+def parse_csv_bytes(file_bytes: bytes):
+    text = file_bytes.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
+    cols = [c.strip() for c in reader.fieldnames or []]
+    missing = [c for c in MACHINE_COLS if c not in cols]
+    if missing:
+        raise ValueError(f"CSV inválido. Faltan columnas: {missing}")
+    rows = []
+    for row in reader:
+        rows.append({k: (row.get(k) or "").strip() for k in MACHINE_COLS})
+    return rows
 
 # =========================
 # PAGES
 # =========================
 def page_login():
     st.subheader("🔐 Login")
-
     col1, col2 = st.columns([1, 1])
     with col1:
         username = st.text_input("Usuario", placeholder="cristian")
@@ -254,7 +249,6 @@ def page_login():
         if not username.strip() or not password:
             st.error("Completa usuario y contraseña.")
             return
-
         ok, err = login_user(username, password)
         if ok:
             st.success("Login correcto.")
@@ -263,7 +257,6 @@ def page_login():
         else:
             st.error(err or "No se pudo iniciar sesión.")
 
-
 def page_machines():
     if not is_logged_in():
         st.warning("Debes iniciar sesión.")
@@ -271,65 +264,168 @@ def page_machines():
 
     st.subheader("🖥️ Máquinas")
 
-    # Buscar máquina por ID
-    colA, colB = st.columns([1, 2])
+    # Filtros
+    with st.expander("🔎 Buscar / Filtrar", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            f_id = st.text_input("ID (exacto o parte)", placeholder="32045")
+        with c2:
+            f_fab = st.text_input("Fabricante", placeholder="ATRONIC")
+        with c3:
+            f_sector = st.text_input("Sector", placeholder="TERRAZA")
+        with c4:
+            f_estado = st.selectbox("Estado", ["(Todos)"] + ESTADOS_MAQUINA)
+
+        c5, c6 = st.columns(2)
+        with c5:
+            f_modelo = st.text_input("Modelo", placeholder="EMOTION")
+        with c6:
+            f_banco = st.text_input("Banco", placeholder="TE-05")
+
+    # Cargar lista
+    rows = db_fetchall("select * from public.machines order by id_maquina asc")
+    # filtrar en memoria
+    def match(row):
+        if f_id.strip():
+            if f_id.strip() not in str(row.get("id_maquina", "")):
+                return False
+        if f_fab.strip() and f_fab.strip().lower() not in (row.get("fabricante") or "").lower():
+            return False
+        if f_sector.strip() and f_sector.strip().lower() not in (row.get("sector") or "").lower():
+            return False
+        if f_modelo.strip() and f_modelo.strip().lower() not in (row.get("modelo") or "").lower():
+            return False
+        if f_banco.strip() and f_banco.strip().lower() not in (row.get("banco") or "").lower():
+            return False
+        if f_estado != "(Todos)" and (row.get("estado") or "") != f_estado:
+            return False
+        return True
+
+    filtered = [r for r in rows if match(r)]
+
+    # Acciones CSV
+    colA, colB, colC = st.columns([1, 1, 2])
     with colA:
-        mid_str = st.text_input("ID Máquina", placeholder="32045")
+        st.download_button(
+            "⬇️ Descargar CSV (máquinas filtradas)",
+            data=machines_to_csv(filtered),
+            file_name="machines_export.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
     with colB:
-        st.caption("Tip: escribe el ID y presiona Enter o completa el formulario y guarda.")
+        up = st.file_uploader("📤 Importar CSV", type=["csv"], label_visibility="collapsed")
+    with colC:
+        st.caption("CSV debe traer columnas: id_maquina, serie, fabricante, modelo, juego, sector, banco, estado, notas")
 
-    machine = None
-    if mid_str.strip().isdigit():
-        mid = int(mid_str.strip())
-        machine = db_fetchone("select * from public.machines where id_maquina=%s", (mid,))
+    if up is not None:
+        try:
+            incoming = parse_csv_bytes(up.getvalue())
+            count = 0
+            for r in incoming:
+                # normalizar
+                mid = int(r["id_maquina"]) if str(r["id_maquina"]).strip().isdigit() else None
+                if not mid:
+                    continue
+                estado = r["estado"] if r["estado"] in ESTADOS_MAQUINA else "Operativa"
+                db_execute(
+                    """
+                    insert into public.machines
+                      (id_maquina, serie, fabricante, modelo, juego, sector, banco, estado, notas)
+                    values
+                      (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    on conflict (id_maquina) do update set
+                      serie=excluded.serie,
+                      fabricante=excluded.fabricante,
+                      modelo=excluded.modelo,
+                      juego=excluded.juego,
+                      sector=excluded.sector,
+                      banco=excluded.banco,
+                      estado=excluded.estado,
+                      notas=excluded.notas
+                    """,
+                    (
+                        mid,
+                        r["serie"],
+                        r["fabricante"],
+                        r["modelo"],
+                        r["juego"],
+                        r["sector"],
+                        r["banco"],
+                        estado,
+                        r["notas"],
+                    ),
+                )
+                count += 1
+            st.success(f"✅ Importación lista. Filas procesadas: {count}")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error importando CSV: {e}")
 
-    # Formulario (con tus campos)
+    st.divider()
+
+    # Tabla + acciones
+    st.markdown("### 📋 Lista de máquinas")
+    if not filtered:
+        st.info("No hay máquinas con esos filtros.")
+        return
+
+    # selector para editar / ver historial
+    ids = [r["id_maquina"] for r in filtered]
+    csel1, csel2 = st.columns([1, 1])
+    with csel1:
+        selected_id = st.selectbox("Selecciona una máquina para ver / editar", ids)
+    with csel2:
+        quick = st.button("📚 Ver historial de la seleccionada", use_container_width=True)
+
+    if quick:
+        st.session_state["history_id"] = int(selected_id)
+        st.session_state["page"] = "Historial"
+        st.rerun()
+
+    machine = db_fetchone("select * from public.machines where id_maquina=%s", (int(selected_id),))
+
+    st.divider()
+    st.markdown("### ✏️ Editar máquina")
+
     with st.form("machine_form", clear_on_submit=False):
         c1, c2 = st.columns(2)
         with c1:
-            id_maquina = st.number_input("ID Máquina", min_value=1, step=1, value=int(machine["id_maquina"]) if machine else 1)
-            serie = st.text_input("Serie", value=machine["serie"] if machine else "")
-            estado = st.selectbox("Estado", ESTADOS_MAQUINA, index=ESTADOS_MAQUINA.index(machine["estado"]) if machine and machine.get("estado") in ESTADOS_MAQUINA else 0)
+            id_maquina = st.number_input("ID Máquina", min_value=1, step=1, value=int(machine["id_maquina"]))
+            serie = st.text_input("Serie", value=machine.get("serie") or "")
+            estado = st.selectbox(
+                "Estado",
+                ESTADOS_MAQUINA,
+                index=ESTADOS_MAQUINA.index(machine.get("estado")) if machine.get("estado") in ESTADOS_MAQUINA else 0,
+            )
         with c2:
-            fabricante = st.text_input("Fabricante", value=machine["fabricante"] if machine else "")
-            modelo = st.text_input("Modelo", value=machine["modelo"] if machine else "")
-            juego = st.text_input("Juego", value=machine["juego"] if machine else "")
+            fabricante = st.text_input("Fabricante", value=machine.get("fabricante") or "")
+            modelo = st.text_input("Modelo", value=machine.get("modelo") or "")
+            juego = st.text_input("Juego", value=machine.get("juego") or "")
 
         c3, c4 = st.columns(2)
         with c3:
-            sector = st.text_input("Sector", value=machine["sector"] if machine else "")
+            sector = st.text_input("Sector", value=machine.get("sector") or "")
         with c4:
-            banco = st.text_input("Banco", value=machine["banco"] if machine else "")
+            banco = st.text_input("Banco", value=machine.get("banco") or "")
 
-        notas = st.text_area("Notas", value=machine["notas"] if machine else "", height=120)
-
+        notas = st.text_area("Notas", value=machine.get("notas") or "", height=120)
         submitted = st.form_submit_button("💾 Guardar / Actualizar", type="primary")
 
     if submitted:
         try:
-            # UPSERT por PK id_maquina
             db_execute(
                 """
-                insert into public.machines
-                  (id_maquina, serie, fabricante, modelo, juego, sector, banco, estado, notas)
-                values
-                  (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                on conflict (id_maquina) do update set
-                  serie=excluded.serie,
-                  fabricante=excluded.fabricante,
-                  modelo=excluded.modelo,
-                  juego=excluded.juego,
-                  sector=excluded.sector,
-                  banco=excluded.banco,
-                  estado=excluded.estado,
-                  notas=excluded.notas
+                update public.machines
+                set serie=%s, fabricante=%s, modelo=%s, juego=%s, sector=%s, banco=%s, estado=%s, notas=%s
+                where id_maquina=%s
                 """,
-                (int(id_maquina), serie, fabricante, modelo, juego, sector, banco, estado, notas),
+                (serie, fabricante, modelo, juego, sector, banco, estado, notas, int(id_maquina)),
             )
-            st.success("✅ Máquina guardada/actualizada.")
+            st.success("✅ Máquina actualizada.")
+            st.rerun()
         except Exception as e:
-            st.error(f"Error guardando máquina: {e}")
-
+            st.error(f"Error actualizando máquina: {e}")
 
 def page_register_maintenance():
     if not is_logged_in():
@@ -339,7 +435,6 @@ def page_register_maintenance():
     st.subheader("📝 Registrar Mantención")
 
     u = current_user()
-
     with st.form("maint_form", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -351,20 +446,19 @@ def page_register_maintenance():
         with c3:
             tecnico = st.text_input("Técnico", value=u["nombre"])
 
-        falla = st.text_input("Falla / Síntoma", placeholder="Ej: no acepta billetes / error SAS / reinicios")
+        falla = st.text_input("Falla / Síntoma")
         diagnostico = st.text_area("Diagnóstico", height=110)
         accion = st.text_area("Acción realizada", height=110)
-        repuestos = st.text_input("Repuestos", placeholder="Ej: BV head, cable SAS, fuente, bobina, etc.")
-        link_adjuntos = st.text_input("Link adjuntos", placeholder="Drive/OneDrive/URL (opcional)")
+        repuestos = st.text_input("Repuestos")
+        link_adjuntos = st.text_input("Link adjuntos (opcional)")
 
         ok = st.form_submit_button("✅ Guardar registro", type="primary")
 
     if ok:
         try:
-            # validar máquina existe
             m = db_fetchone("select id_maquina from public.machines where id_maquina=%s", (int(id_maquina),))
             if not m:
-                st.error("⚠️ Esa máquina no existe en la tabla. Primero crea/guarda la máquina en 'Máquinas'.")
+                st.error("⚠️ Esa máquina no existe. Primero créala en 'Máquinas'.")
                 return
 
             db_execute(
@@ -391,7 +485,6 @@ def page_register_maintenance():
         except Exception as e:
             st.error(f"Error guardando mantención: {e}")
 
-
 def page_history():
     if not is_logged_in():
         st.warning("Debes iniciar sesión.")
@@ -399,9 +492,10 @@ def page_history():
 
     st.subheader("📚 Historial por Máquina")
 
+    default_id = st.session_state.get("history_id", "")
     colA, colB, colC = st.columns([1, 1, 2])
     with colA:
-        id_str = st.text_input("ID Máquina", placeholder="32045")
+        id_str = st.text_input("ID Máquina", value=str(default_id) if default_id else "", placeholder="32045")
     with colB:
         tipo = st.selectbox("Filtrar tipo", ["(Todos)"] + TIPOS_MANTENCION)
     with colC:
@@ -415,6 +509,7 @@ def page_history():
         return
 
     mid = int(id_str.strip())
+    st.session_state["history_id"] = mid
 
     m = db_fetchone("select * from public.machines where id_maquina=%s", (mid,))
     if not m:
@@ -455,7 +550,6 @@ Sector: **{m.get("sector","")}** • Banco: **{m.get("banco","")}** • Estado: 
         st.info("No hay registros de mantención para esta máquina.")
         return
 
-    # tabla bonita
     show = []
     for r in rows:
         show.append(
@@ -465,6 +559,7 @@ Sector: **{m.get("sector","")}** • Banco: **{m.get("banco","")}** • Estado: 
                 "Técnico": r.get("tecnico"),
                 "Estado final": r.get("estado_final"),
                 "Falla": r.get("falla"),
+                "Diagnóstico": r.get("diagnostico"),
                 "Acción": r.get("accion"),
                 "Repuestos": r.get("repuestos"),
                 "Adjuntos": r.get("link_adjuntos"),
@@ -472,7 +567,6 @@ Sector: **{m.get("sector","")}** • Banco: **{m.get("banco","")}** • Estado: 
         )
 
     st.dataframe(show, use_container_width=True, hide_index=True)
-
 
 def page_users():
     if not is_logged_in():
@@ -484,7 +578,6 @@ def page_users():
 
     st.subheader("👥 Usuarios")
 
-    # lista
     users = db_fetchall("select id, username, role, nombre, is_active, created_at from public.users order by id asc")
     st.dataframe(users, use_container_width=True, hide_index=True)
 
@@ -494,7 +587,7 @@ def page_users():
     with st.form("create_user", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
         with c1:
-            username = st.text_input("Username (sin espacios)", placeholder="tecnico1")
+            username = st.text_input("Username", placeholder="tecnico1")
         with c2:
             nombre = st.text_input("Nombre", placeholder="Juan Pérez")
         with c3:
@@ -512,7 +605,6 @@ def page_users():
         try:
             u = username.strip().lower()
             pw_hash = pwd_context.hash(password)
-
             db_execute(
                 """
                 insert into public.users (username, password_hash, role, nombre, is_active, created_at)
@@ -546,16 +638,13 @@ def page_users():
         except Exception as e:
             st.error(f"Error actualizando: {e}")
 
-
 # =========================
 # MAIN
 # =========================
 st.title(APP_TITLE)
 
-# page state
 if "page" not in st.session_state:
     st.session_state["page"] = "Login"
-
 if "user" not in st.session_state:
     st.session_state["user"] = None
 
@@ -563,12 +652,10 @@ render_sidebar()
 
 page = st.session_state.get("page", "Login")
 
-# proteger páginas si no logeado
 if page != "Login" and not is_logged_in():
     st.session_state["page"] = "Login"
     page = "Login"
 
-# router
 if page == "Login":
     page_login()
 elif page == "Máquinas":
