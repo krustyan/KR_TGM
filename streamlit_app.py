@@ -4,7 +4,7 @@ import csv
 from datetime import datetime, date
 
 import streamlit as st
-import psycopg2
+import psycopg
 from psycopg2.extras import RealDictCursor
 from passlib.context import CryptContext
 
