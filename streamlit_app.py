@@ -449,11 +449,12 @@ def page_history():
         return
 
     df = pd.DataFrame(rows)
-    cols = [
-        "created_at", "fecha", "tipo", "turno",
-        "tecnico_nombre", "tecnico_username",
-        "estado_final",_attach", "falla", "diagnostico", "accion", "repuestos", "link_adjuntos"
-    ]
+cols = [
+    "created_at", "fecha", "tipo", "turno",
+    "tecnico_nombre", "tecnico_username",
+    "estado_final", "falla", "diagnostico", "accion",
+    "repuestos", "link_adjuntos"
+]
     cols = [c for c in cols if c in df.columns]
     st.dataframe(df[cols], use_container_width=True, hide_index=True)
 
