@@ -3,7 +3,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import pandas as pd
 import bcrypt
-from datetime import date, datetime
+from datetime import date
 
 # =========================
 # CONFIG UI
@@ -47,10 +47,24 @@ def db_execute(sql: str, params=None):
             conn.commit()
 
 def tables_exist() -> bool:
+    """
+    Verifica EXISTENCIA REAL de las 3 tablas requeridas.
+    Además, muestra un debug en sidebar con el resultado de to_regclass.
+    """
     try:
-        r = db_fetchone("select to_regclass('public.users') as users;")
-        return bool(r and r["users"])
-    except Exception:
+        r = db_fetchone(
+            """
+            select
+              to_regclass('public.users') as u,
+              to_regclass('public.machines') as m,
+              to_regclass('public.maintenance') as t
+            """
+        )
+        # Debug visible (temporal)
+        st.sidebar.caption(f"DEBUG to_regclass: {r}")
+        return bool(r and r.get("u") and r.get("m") and r.get("t"))
+    except Exception as e:
+        st.sidebar.error(f"DEBUG tables_exist error: {e}")
         return False
 
 # =========================
@@ -87,7 +101,7 @@ def is_supervisor() -> bool:
 # FIRST RUN SETUP (ADMIN)
 # =========================
 def count_users() -> int:
-    r = db_fetchone("select count(*)::int as c from users;")
+    r = db_fetchone("select count(*)::int as c from public.users;")
     return int(r["c"])
 
 def show_first_admin_setup():
@@ -121,7 +135,7 @@ def show_first_admin_setup():
         ph = hash_password(password)
         try:
             db_execute(
-                "insert into users (username, password_hash, role, nombre, is_active) values (%s,%s,%s,%s,true);",
+                "insert into public.users (username, password_hash, role, nombre, is_active) values (%s,%s,%s,%s,true);",
                 (username.lower().strip(), ph, "admin", nombre.strip() if nombre else None),
             )
             st.success("✅ Admin creado. Ahora inicia sesión.")
@@ -144,7 +158,7 @@ def show_login():
 
         if ok:
             u = db_fetchone(
-                "select id, username, password_hash, role, nombre, is_active from users where username=%s;",
+                "select id, username, password_hash, role, nombre, is_active from public.users where username=%s;",
                 (username.lower().strip(),),
             )
             if not u or not u.get("is_active"):
@@ -155,7 +169,6 @@ def show_login():
                 st.error("Contraseña incorrecta.")
                 return
 
-            # guardar sesión (sin hash)
             st.session_state["user"] = {
                 "id": u["id"],
                 "username": u["username"],
@@ -188,7 +201,7 @@ def page_users_admin():
         st.error("Solo Admin puede gestionar usuarios.")
         return
 
-    users = db_fetchall("select id, username, role, nombre, is_active, created_at from users order by id;")
+    users = db_fetchall("select id, username, role, nombre, is_active, created_at from public.users order by id;")
     dfu = pd.DataFrame(users)
     if not dfu.empty:
         st.dataframe(dfu, use_container_width=True, hide_index=True)
@@ -211,7 +224,7 @@ def page_users_admin():
             return
         try:
             db_execute(
-                "insert into users (username, password_hash, role, nombre, is_active) values (%s,%s,%s,%s,true);",
+                "insert into public.users (username, password_hash, role, nombre, is_active) values (%s,%s,%s,%s,true);",
                 (username.lower().strip(), hash_password(password), role, nombre.strip() if nombre else None),
             )
             st.success("✅ Usuario creado.")
@@ -223,10 +236,9 @@ def page_users_admin():
 # MACHINES
 # =========================
 def upsert_machine(m):
-    # inserta o actualiza
     db_execute(
         """
-        insert into machines (id_maquina, fabricante, modelo, denominacion, ubicacion, sector, estado, notas)
+        insert into public.machines (id_maquina, fabricante, modelo, denominacion, ubicacion, sector, estado, notas)
         values (%s,%s,%s,%s,%s,%s,%s,%s)
         on conflict (id_maquina) do update set
           fabricante=excluded.fabricante,
@@ -266,14 +278,14 @@ def page_machines():
     if q.strip():
         try:
             mid = int(q.strip())
-            machines = db_fetchall("select * from machines where id_maquina=%s;", (mid,))
+            machines = db_fetchall("select * from public.machines where id_maquina=%s;", (mid,))
         except:
             machines = db_fetchall(
-                "select * from machines where (modelo ilike %s or ubicacion ilike %s or sector ilike %s) order by id_maquina limit %s;",
+                "select * from public.machines where (modelo ilike %s or ubicacion ilike %s or sector ilike %s) order by id_maquina limit %s;",
                 (f"%{q}%", f"%{q}%", f"%{q}%", show_n),
             )
     else:
-        machines = db_fetchall("select * from machines order by id_maquina limit %s;", (show_n,))
+        machines = db_fetchall("select * from public.machines order by id_maquina limit %s;", (show_n,))
 
     dfm = pd.DataFrame(machines)
     if not dfm.empty:
@@ -345,7 +357,7 @@ def page_new_maintenance():
         st.error("ID Máquina debe ser numérico.")
         return
 
-    m = db_fetchone("select * from machines where id_maquina=%s;", (mid,))
+    m = db_fetchone("select * from public.machines where id_maquina=%s;", (mid,))
     if m:
         st.success(f"✅ Máquina encontrada: {mid} • {m.get('modelo','')} • {m.get('ubicacion','')}")
         with st.expander("Ver ficha máquina"):
@@ -370,7 +382,7 @@ def page_new_maintenance():
         try:
             db_execute(
                 """
-                insert into maintenance
+                insert into public.maintenance
                 (id_maquina, tipo, fecha, turno, tecnico_username, tecnico_nombre, falla, diagnostico, accion, repuestos, estado_final, link_adjuntos, created_at)
                 values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now());
                 """,
@@ -415,7 +427,7 @@ def page_history():
         st.error("ID Máquina debe ser numérico.")
         return
 
-    m = db_fetchone("select * from machines where id_maquina=%s;", (mid,))
+    m = db_fetchone("select * from public.machines where id_maquina=%s;", (mid,))
     if m:
         st.caption(f"🎰 {mid} • {m.get('modelo','')} • {m.get('ubicacion','')} • {m.get('sector','')}")
     else:
@@ -423,12 +435,12 @@ def page_history():
 
     if tipo == "(Todos)":
         rows = db_fetchall(
-            "select * from maintenance where id_maquina=%s order by created_at desc limit %s;",
+            "select * from public.maintenance where id_maquina=%s order by created_at desc limit %s;",
             (mid, limit),
         )
     else:
         rows = db_fetchall(
-            "select * from maintenance where id_maquina=%s and tipo=%s order by created_at desc limit %s;",
+            "select * from public.maintenance where id_maquina=%s and tipo=%s order by created_at desc limit %s;",
             (mid, tipo, limit),
         )
 
@@ -437,11 +449,10 @@ def page_history():
         return
 
     df = pd.DataFrame(rows)
-    # Orden y columnas “bonitas”
     cols = [
         "created_at", "fecha", "tipo", "turno",
         "tecnico_nombre", "tecnico_username",
-        "estado_final", "falla", "diagnostico", "accion", "repuestos", "link_adjuntos"
+        "estado_final",_attach", "falla", "diagnostico", "accion", "repuestos", "link_adjuntos"
     ]
     cols = [c for c in cols if c in df.columns]
     st.dataframe(df[cols], use_container_width=True, hide_index=True)
@@ -503,19 +514,15 @@ with st.sidebar:
 try:
     if page == "Login":
         show_login()
-
     elif page == "Máquinas":
         require_login()
         page_machines()
-
     elif page == "Registrar intervención":
         require_login()
         page_new_maintenance()
-
     elif page == "Historial":
         require_login()
         page_history()
-
     elif page == "Usuarios (Admin)":
         require_login()
         page_users_admin()
