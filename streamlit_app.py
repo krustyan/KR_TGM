@@ -10,12 +10,14 @@ from psycopg.rows import dict_row
 st.set_page_config(page_title="KR_TGM • Mantenciones e Historial", layout="wide")
 
 
-# -------------------------
+# =========================
 # DB / Secrets
-# -------------------------
+# =========================
 def get_db_url() -> str:
+    # Streamlit Cloud: st.secrets
     if "DB_URL" in st.secrets:
         return st.secrets["DB_URL"]
+    # Local dev fallback
     env = os.getenv("DB_URL")
     if env:
         return env
@@ -23,6 +25,7 @@ def get_db_url() -> str:
 
 
 def connect():
+    # row_factory=dict_row => fetchall/fetchone entregan dicts
     return psycopg.connect(get_db_url(), row_factory=dict_row, connect_timeout=8)
 
 
@@ -38,9 +41,9 @@ def verify_password(plain: str, hashed: str) -> bool:
         return False
 
 
-# -------------------------
+# =========================
 # DB Setup
-# -------------------------
+# =========================
 def db_prepare():
     with connect() as conn:
         with conn.cursor() as cur:
@@ -84,7 +87,7 @@ def db_prepare():
         conn.commit()
 
 
-def get_users_count() -> int:
+def users_count() -> int:
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("select count(*) as c from public.users")
@@ -115,13 +118,14 @@ def get_user_by_username(username: str):
 
 def ensure_bootstrap_admin():
     """
-    Si la tabla users está vacía, crea un admin inicial desde Secrets:
-    BOOTSTRAP_ADMIN_USER / BOOTSTRAP_ADMIN_PASS
+    Si la tabla users está vacía, crea el primer admin desde Secrets:
+      BOOTSTRAP_ADMIN_USER
+      BOOTSTRAP_ADMIN_PASS
     """
-    if get_users_count() > 0:
+    if users_count() > 0:
         return
 
-    admin_user = st.secrets.get("BOOTSTRAP_ADMIN_USER", "").strip().lower()
+    admin_user = st.secrets.get("BOOTSTRAP_ADMIN_USER", "")
     admin_pass = st.secrets.get("BOOTSTRAP_ADMIN_PASS", "")
 
     if not admin_user or not admin_pass:
@@ -133,9 +137,9 @@ def ensure_bootstrap_admin():
     create_user(admin_user, admin_pass, "admin")
 
 
-# -------------------------
+# =========================
 # Machines
-# -------------------------
+# =========================
 def machines_list(search: str = ""):
     q = "select * from public.machines"
     params = ()
@@ -173,9 +177,9 @@ def machine_get_by_mcc(mcc: str):
             return cur.fetchone()
 
 
-# -------------------------
+# =========================
 # Maintenance
-# -------------------------
+# =========================
 def maintenance_list(status_filter: str = "todas", search_mcc: str = ""):
     q = "select * from public.maintenance where 1=1"
     params = []
@@ -210,9 +214,9 @@ def maintenance_create(mcc: str, mtype: str, status: str, scheduled_date, execut
         conn.commit()
 
 
-# -------------------------
+# =========================
 # Boot
-# -------------------------
+# =========================
 st.title("🛠️ KR_TGM • Mantenciones e Historial")
 st.caption("Registro de máquinas, mantenciones e historial (Supabase + Streamlit Cloud)")
 
@@ -225,9 +229,9 @@ except Exception as e:
     st.stop()
 
 
-# -------------------------
-# Auth UI
-# -------------------------
+# =========================
+# Auth
+# =========================
 def logout():
     for k in ["auth", "user_id", "username", "role"]:
         st.session_state.pop(k, None)
@@ -244,9 +248,9 @@ with st.sidebar:
         st.info("Inicia sesión para continuar")
 
 
-# -------------------------
+# =========================
 # Login Screen (solo login)
-# -------------------------
+# =========================
 if not st.session_state.get("auth"):
     st.subheader("Iniciar sesión")
 
@@ -269,12 +273,11 @@ if not st.session_state.get("auth"):
     st.stop()
 
 
-# -------------------------
+# =========================
 # Main App
-# -------------------------
+# =========================
 role = st.session_state.get("role", "read")
 
-# Menú principal
 pages = ["🎰 Máquinas", "🛠 Mantenciones", "📜 Historial"]
 if role == "admin":
     pages.append("⚙️ Administración")
@@ -284,7 +287,6 @@ page = st.sidebar.radio("Menú", pages)
 # ---- Máquinas
 if page == "🎰 Máquinas":
     st.subheader("Máquinas")
-
     left, right = st.columns([2, 1], vertical_alignment="top")
 
     with left:
@@ -296,7 +298,6 @@ if page == "🎰 Máquinas":
     with right:
         st.markdown("### Crear / Editar (por MCC)")
         can_edit = role in ("admin", "supervisor")
-
         if not can_edit:
             st.info("Tu rol no permite editar máquinas.")
         else:
@@ -304,10 +305,7 @@ if page == "🎰 Máquinas":
             if st.button("Cargar datos por MCC"):
                 if mcc:
                     m = machine_get_by_mcc(mcc)
-                    if m:
-                        st.session_state["m_form"] = m
-                    else:
-                        st.session_state["m_form"] = {"mcc": mcc, "brand": "", "model": "", "serial": "", "sector": "", "status": "activa"}
+                    st.session_state["m_form"] = m if m else {"mcc": mcc, "brand": "", "model": "", "serial": "", "sector": "", "status": "activa"}
 
             m_form = st.session_state.get("m_form", {"mcc": "", "brand": "", "model": "", "serial": "", "sector": "", "status": "activa"})
             mcc2 = st.text_input("MCC (form)", value=m_form.get("mcc", ""), key="mcc_form").strip()
@@ -322,22 +320,17 @@ if page == "🎰 Máquinas":
                 if not mcc2:
                     st.error("MCC es obligatorio.")
                 else:
-                    try:
-                        machine_upsert(mcc2, brand, model, serial, sector, status)
-                        st.success("Guardado.")
-                        st.session_state.pop("m_form", None)
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error: {type(e).__name__}: {e}")
+                    machine_upsert(mcc2, brand, model, serial, sector, status)
+                    st.success("Guardado.")
+                    st.session_state.pop("m_form", None)
+                    st.rerun()
 
 # ---- Mantenciones
 elif page == "🛠 Mantenciones":
     st.subheader("Mantenciones")
-
     can_write = role in ("admin", "supervisor", "tecnico")
 
     c1, c2 = st.columns([2, 1], vertical_alignment="top")
-
     with c1:
         colf1, colf2 = st.columns([1, 1])
         with colf1:
@@ -366,17 +359,13 @@ elif page == "🛠 Mantenciones":
                 if not mcc:
                     st.error("MCC es obligatorio.")
                 else:
-                    try:
-                        maintenance_create(mcc, mtype, mstatus, scheduled, executed, tech, detail)
-                        st.success("Mantención registrada.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error: {type(e).__name__}: {e}")
+                    maintenance_create(mcc, mtype, mstatus, scheduled, executed, tech, detail)
+                    st.success("Mantención registrada.")
+                    st.rerun()
 
 # ---- Historial
 elif page == "📜 Historial":
     st.subheader("Historial (últimas 200)")
-
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -403,11 +392,8 @@ elif page == "⚙️ Administración":
         if not new_user or not new_pass:
             st.error("Completa usuario y contraseña.")
         else:
-            try:
-                create_user(new_user, new_pass, new_role)
-                st.success("Usuario creado.")
-            except Exception as e:
-                st.error(f"No se pudo crear: {type(e).__name__}: {e}")
+            create_user(new_user, new_pass, new_role)
+            st.success("Usuario creado.")
 
     st.markdown("---")
     st.markdown("### Usuarios existentes")
@@ -415,6 +401,6 @@ elif page == "⚙️ Administración":
         with conn.cursor() as cur:
             cur.execute("select id, username, role, created_at from public.users order by id")
             users = cur.fetchall()
+
     udf = pd.DataFrame(users) if users else pd.DataFrame()
     st.dataframe(udf, use_container_width=True, hide_index=True)
-
