@@ -1,4 +1,3 @@
-# streamlit_app.py
 import os
 import datetime as dt
 
@@ -8,25 +7,15 @@ import bcrypt
 import psycopg
 from psycopg.rows import dict_row
 
-
-# =========================
-# Config UI
-# =========================
 st.set_page_config(page_title="KR_TGM • Mantenciones e Historial", layout="wide")
 
 
-# =========================
-# Helpers
-# =========================
+# -------------------------
+# DB / Secrets
+# -------------------------
 def get_db_url() -> str:
-    """
-    DB_URL debe venir desde Streamlit Secrets.
-    Recomendado (Supabase Session Pooler IPv4):
-    postgresql://...@aws-0-us-west-2.pooler.supabase.com:5432/postgres?sslmode=require
-    """
     if "DB_URL" in st.secrets:
         return st.secrets["DB_URL"]
-    # fallback local (si quieres usar env var en desarrollo)
     env = os.getenv("DB_URL")
     if env:
         return env
@@ -34,14 +23,11 @@ def get_db_url() -> str:
 
 
 def connect():
-    db_url = get_db_url()
-    # dict_row => fetch devuelve dicts
-    return psycopg.connect(db_url, row_factory=dict_row, connect_timeout=8)
+    return psycopg.connect(get_db_url(), row_factory=dict_row, connect_timeout=8)
 
 
 def hash_password(plain: str) -> str:
-    pw = plain.encode("utf-8")
-    hashed = bcrypt.hashpw(pw, bcrypt.gensalt(rounds=12))
+    hashed = bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt(rounds=12))
     return hashed.decode("utf-8")
 
 
@@ -52,19 +38,10 @@ def verify_password(plain: str, hashed: str) -> bool:
         return False
 
 
-def require_login():
-    if not st.session_state.get("auth"):
-        st.stop()
-
-
-# =========================
+# -------------------------
 # DB Setup
-# =========================
+# -------------------------
 def db_prepare():
-    """
-    Crea tablas mínimas si no existen.
-    OJO: Supabase suele traer schema "public" por defecto.
-    """
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -104,21 +81,14 @@ def db_prepare():
                 created_at timestamptz not null default now()
             );
             """)
-
         conn.commit()
 
 
-# =========================
-# Auth DB ops
-# =========================
-def get_user_by_username(username: str):
+def get_users_count() -> int:
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "select id, username, password_hash, role from public.users where username = %s",
-                (username.strip().lower(),)
-            )
-            return cur.fetchone()
+            cur.execute("select count(*) as c from public.users")
+            return int(cur.fetchone()["c"])
 
 
 def create_user(username: str, plain_password: str, role: str):
@@ -128,14 +98,44 @@ def create_user(username: str, plain_password: str, role: str):
         with conn.cursor() as cur:
             cur.execute(
                 "insert into public.users (username, password_hash, role) values (%s, %s, %s)",
-                (username, pwd_hash, role)
+                (username, pwd_hash, role),
             )
         conn.commit()
 
 
-# =========================
-# Machines DB ops
-# =========================
+def get_user_by_username(username: str):
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "select id, username, password_hash, role from public.users where username = %s",
+                (username.strip().lower(),),
+            )
+            return cur.fetchone()
+
+
+def ensure_bootstrap_admin():
+    """
+    Si la tabla users está vacía, crea un admin inicial desde Secrets:
+    BOOTSTRAP_ADMIN_USER / BOOTSTRAP_ADMIN_PASS
+    """
+    if get_users_count() > 0:
+        return
+
+    admin_user = st.secrets.get("BOOTSTRAP_ADMIN_USER", "").strip().lower()
+    admin_pass = st.secrets.get("BOOTSTRAP_ADMIN_PASS", "")
+
+    if not admin_user or not admin_pass:
+        st.error(
+            "No hay usuarios creados aún. Define BOOTSTRAP_ADMIN_USER y BOOTSTRAP_ADMIN_PASS en Secrets para crear el primer admin."
+        )
+        st.stop()
+
+    create_user(admin_user, admin_pass, "admin")
+
+
+# -------------------------
+# Machines
+# -------------------------
 def machines_list(search: str = ""):
     q = "select * from public.machines"
     params = ()
@@ -173,9 +173,9 @@ def machine_get_by_mcc(mcc: str):
             return cur.fetchone()
 
 
-# =========================
-# Maintenance DB ops
-# =========================
+# -------------------------
+# Maintenance
+# -------------------------
 def maintenance_list(status_filter: str = "todas", search_mcc: str = ""):
     q = "select * from public.maintenance where 1=1"
     params = []
@@ -210,99 +210,79 @@ def maintenance_create(mcc: str, mtype: str, status: str, scheduled_date, execut
         conn.commit()
 
 
-# =========================
-# UI: Header
-# =========================
+# -------------------------
+# Boot
+# -------------------------
 st.title("🛠️ KR_TGM • Mantenciones e Historial")
 st.caption("Registro de máquinas, mantenciones e historial (Supabase + Streamlit Cloud)")
 
-
-# =========================
-# Boot: prepare DB (con mensaje claro)
-# =========================
 try:
     db_prepare()
+    ensure_bootstrap_admin()
 except Exception as e:
     st.error("No se pudo preparar la base de datos. Revisa DB_URL en Secrets.")
     st.info(f"Detalle técnico: {type(e).__name__}: {e}")
     st.stop()
 
 
-# =========================
-# Sidebar: Session
-# =========================
+# -------------------------
+# Auth UI
+# -------------------------
+def logout():
+    for k in ["auth", "user_id", "username", "role"]:
+        st.session_state.pop(k, None)
+    st.rerun()
+
+
 with st.sidebar:
     st.subheader("Sesión")
-
     if st.session_state.get("auth"):
-        st.success(f"Conectado: {st.session_state['username']} ({st.session_state['role']})")
+        st.success(f"{st.session_state['username']} ({st.session_state['role']})")
         if st.button("Cerrar sesión", use_container_width=True):
-            for k in ["auth", "user_id", "username", "role"]:
-                st.session_state.pop(k, None)
-            st.rerun()
+            logout()
     else:
         st.info("Inicia sesión para continuar")
 
 
-# =========================
-# Login
-# =========================
+# -------------------------
+# Login Screen (solo login)
+# -------------------------
 if not st.session_state.get("auth"):
-    c1, c2 = st.columns([1, 1])
+    st.subheader("Iniciar sesión")
 
-    with c1:
-        st.subheader("Iniciar sesión")
-        username = st.text_input("Usuario", placeholder="cristian").strip().lower()
-        password = st.text_input("Contraseña", type="password")
+    username = st.text_input("Usuario", placeholder="cristian").strip().lower()
+    password = st.text_input("Contraseña", type="password")
 
-        if st.button("Entrar", use_container_width=True):
-            u = get_user_by_username(username)
-            if not u:
-                st.error("Usuario no existe.")
-            elif not verify_password(password, u["password_hash"]):
-                st.error("Contraseña incorrecta.")
-            else:
-                st.session_state["auth"] = True
-                st.session_state["user_id"] = u["id"]
-                st.session_state["username"] = u["username"]
-                st.session_state["role"] = u["role"]
-                st.rerun()
-
-    with c2:
-        st.subheader("Crear usuario (solo admin setup)")
-        st.caption("Para crear usuarios desde la app debes ingresar la SETUP_KEY.")
-        setup_key_in = st.text_input("SETUP_KEY", type="password", help="Debe coincidir con st.secrets['SETUP_KEY']")
-        new_user = st.text_input("Nuevo usuario", key="new_user").strip().lower()
-        new_pass = st.text_input("Nueva contraseña", type="password", key="new_pass")
-        new_role = st.selectbox("Rol", ["admin", "supervisor", "tecnico", "read"], index=3)
-
-        if st.button("Crear usuario", use_container_width=True):
-            expected = st.secrets.get("SETUP_KEY")
-            if not expected:
-                st.error("No existe SETUP_KEY en Secrets.")
-            elif setup_key_in != expected:
-                st.error("SETUP_KEY incorrecta.")
-            elif not new_user or not new_pass:
-                st.error("Completa usuario y contraseña.")
-            else:
-                try:
-                    create_user(new_user, new_pass, new_role)
-                    st.success("Usuario creado. Ahora puedes iniciar sesión.")
-                except Exception as e:
-                    st.error(f"No se pudo crear: {type(e).__name__}: {e}")
+    if st.button("Entrar", use_container_width=True):
+        u = get_user_by_username(username)
+        if not u:
+            st.error("Usuario no existe.")
+        elif not verify_password(password, u["password_hash"]):
+            st.error("Contraseña incorrecta.")
+        else:
+            st.session_state["auth"] = True
+            st.session_state["user_id"] = u["id"]
+            st.session_state["username"] = u["username"]
+            st.session_state["role"] = u["role"]
+            st.rerun()
 
     st.stop()
 
 
-# =========================
-# Main App (requiere login)
-# =========================
-require_login()
+# -------------------------
+# Main App
+# -------------------------
+role = st.session_state.get("role", "read")
 
-tabs = st.tabs(["🎰 Máquinas", "🛠 Mantenciones", "📜 Historial"])
+# Menú principal
+pages = ["🎰 Máquinas", "🛠 Mantenciones", "📜 Historial"]
+if role == "admin":
+    pages.append("⚙️ Administración")
 
-# ---- Tab Máquinas
-with tabs[0]:
+page = st.sidebar.radio("Menú", pages)
+
+# ---- Máquinas
+if page == "🎰 Máquinas":
     st.subheader("Máquinas")
 
     left, right = st.columns([2, 1], vertical_alignment="top")
@@ -315,7 +295,6 @@ with tabs[0]:
 
     with right:
         st.markdown("### Crear / Editar (por MCC)")
-        role = st.session_state.get("role", "read")
         can_edit = role in ("admin", "supervisor")
 
         if not can_edit:
@@ -336,7 +315,8 @@ with tabs[0]:
             model = st.text_input("Modelo", value=m_form.get("model", "") or "")
             serial = st.text_input("Serie", value=m_form.get("serial", "") or "")
             sector = st.text_input("Sector", value=m_form.get("sector", "") or "")
-            status = st.selectbox("Estado", ["activa", "fuera_servicio", "baja"], index=["activa","fuera_servicio","baja"].index(m_form.get("status","activa")))
+            status = st.selectbox("Estado", ["activa", "fuera_servicio", "baja"],
+                                  index=["activa", "fuera_servicio", "baja"].index(m_form.get("status", "activa")))
 
             if st.button("Guardar máquina", use_container_width=True):
                 if not mcc2:
@@ -350,11 +330,10 @@ with tabs[0]:
                     except Exception as e:
                         st.error(f"Error: {type(e).__name__}: {e}")
 
-# ---- Tab Mantenciones
-with tabs[1]:
+# ---- Mantenciones
+elif page == "🛠 Mantenciones":
     st.subheader("Mantenciones")
 
-    role = st.session_state.get("role", "read")
     can_write = role in ("admin", "supervisor", "tecnico")
 
     c1, c2 = st.columns([2, 1], vertical_alignment="top")
@@ -388,22 +367,14 @@ with tabs[1]:
                     st.error("MCC es obligatorio.")
                 else:
                     try:
-                        maintenance_create(
-                            mcc=mcc,
-                            mtype=mtype,
-                            status=mstatus,
-                            scheduled_date=scheduled,
-                            executed_date=executed,
-                            technician=tech,
-                            detail=detail,
-                        )
+                        maintenance_create(mcc, mtype, mstatus, scheduled, executed, tech, detail)
                         st.success("Mantención registrada.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error: {type(e).__name__}: {e}")
 
-# ---- Tab Historial
-with tabs[2]:
+# ---- Historial
+elif page == "📜 Historial":
     st.subheader("Historial (últimas 200)")
 
     with connect() as conn:
@@ -418,3 +389,32 @@ with tabs[2]:
 
     hdf = pd.DataFrame(hist) if hist else pd.DataFrame()
     st.dataframe(hdf, use_container_width=True, hide_index=True)
+
+# ---- Administración (solo admin)
+elif page == "⚙️ Administración":
+    st.subheader("Administración • Usuarios (solo admin)")
+
+    st.markdown("### Crear usuario")
+    new_user = st.text_input("Nuevo usuario").strip().lower()
+    new_pass = st.text_input("Nueva contraseña", type="password")
+    new_role = st.selectbox("Rol", ["admin", "supervisor", "tecnico", "read"], index=3)
+
+    if st.button("Crear usuario", use_container_width=True):
+        if not new_user or not new_pass:
+            st.error("Completa usuario y contraseña.")
+        else:
+            try:
+                create_user(new_user, new_pass, new_role)
+                st.success("Usuario creado.")
+            except Exception as e:
+                st.error(f"No se pudo crear: {type(e).__name__}: {e}")
+
+    st.markdown("---")
+    st.markdown("### Usuarios existentes")
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("select id, username, role, created_at from public.users order by id")
+            users = cur.fetchall()
+    udf = pd.DataFrame(users) if users else pd.DataFrame()
+    st.dataframe(udf, use_container_width=True, hide_index=True)
+
