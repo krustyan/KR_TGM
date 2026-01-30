@@ -47,6 +47,7 @@ def verify_password(plain: str, hashed: str) -> bool:
 def db_prepare():
     with connect() as conn:
         with conn.cursor() as cur:
+            # --- users (ok) ---
             cur.execute("""
             create table if not exists public.users (
                 id bigserial primary key,
@@ -57,26 +58,23 @@ def db_prepare():
             );
             """)
 
+            # --- machines: crear si no existe ---
             cur.execute("""
             create table if not exists public.machines (
                 id bigserial primary key,
-                mcc text unique not null,
-                brand text,
-                model text,
-                serial text,
-                sector text,
-                status text not null default 'activa',
+                mcc text unique,
                 created_at timestamptz not null default now()
             );
             """)
 
+            # --- maintenance: crear si no existe ---
             cur.execute("""
             create table if not exists public.maintenance (
                 id bigserial primary key,
-                machine_id bigint references public.machines(id) on delete set null,
+                machine_id bigint,
                 mcc text,
-                type text not null default 'preventiva',
-                status text not null default 'pendiente',
+                type text,
+                status text,
                 scheduled_date date,
                 executed_date date,
                 technician text,
@@ -84,7 +82,44 @@ def db_prepare():
                 created_at timestamptz not null default now()
             );
             """)
+
+            # ===== MIGRACIONES (add column if missing) =====
+            # Machines
+            cur.execute("alter table public.machines add column if not exists brand text;")
+            cur.execute("alter table public.machines add column if not exists model text;")
+            cur.execute("alter table public.machines add column if not exists serial text;")
+            cur.execute("alter table public.machines add column if not exists sector text;")
+            cur.execute("alter table public.machines add column if not exists status text not null default 'activa';")
+
+            # Ensure mcc exists + unique (si no existe, la agrega)
+            cur.execute("alter table public.machines add column if not exists mcc text;")
+            # Índice unique (si ya existe, no pasa nada)
+            cur.execute("create unique index if not exists machines_mcc_uidx on public.machines(mcc);")
+
+            # Maintenance
+            cur.execute("alter table public.maintenance add column if not exists machine_id bigint;")
+            cur.execute("alter table public.maintenance add column if not exists mcc text;")
+            cur.execute("alter table public.maintenance add column if not exists type text not null default 'preventiva';")
+            cur.execute("alter table public.maintenance add column if not exists status text not null default 'pendiente';")
+            cur.execute("alter table public.maintenance add column if not exists scheduled_date date;")
+            cur.execute("alter table public.maintenance add column if not exists executed_date date;")
+            cur.execute("alter table public.maintenance add column if not exists technician text;")
+            cur.execute("alter table public.maintenance add column if not exists detail text;")
+            cur.execute("alter table public.maintenance add column if not exists created_at timestamptz not null default now();")
+
+            # FK (solo si puedes; si ya existe, fallará, así que lo hacemos “best effort”)
+            try:
+                cur.execute("""
+                    alter table public.maintenance
+                    add constraint maintenance_machine_fk
+                    foreign key (machine_id) references public.machines(id)
+                    on delete set null
+                """)
+            except Exception:
+                pass
+
         conn.commit()
+
 
 
 def users_count() -> int:
