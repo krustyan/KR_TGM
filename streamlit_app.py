@@ -130,26 +130,39 @@ st.write("BOOTSTRAP_ADMIN_USER value:", st.secrets.get("BOOTSTRAP_ADMIN_USER"))
 # --- FIN DIAGNÓSTICO ---
 
 def ensure_bootstrap_admin():
-    """
-    Si la tabla users está vacía, crea el primer admin desde Secrets:
-      BOOTSTRAP_ADMIN_USER
-      BOOTSTRAP_ADMIN_PASS
-    """
-    if users_count() > 0:
+    admin_user = (st.secrets.get("BOOTSTRAP_ADMIN_USER") or "").strip().lower()
+    admin_pass = st.secrets.get("BOOTSTRAP_ADMIN_PASS") or ""
+    force = str(st.secrets.get("BOOTSTRAP_FORCE", "false")).lower() in ("1", "true", "yes")
+
+    # si no hay bootstrap configurado, no hacemos nada
+    if not admin_user or not admin_pass:
         return
 
-    admin_user = st.secrets.get("BOOTSTRAP_ADMIN_USER", "")
-    admin_pass = st.secrets.get("BOOTSTRAP_ADMIN_PASS", "")
+    # buscamos usuario
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("select id from public.users where username = %s", (admin_user,))
+            row = cur.fetchone()
 
-    if not admin_user or not admin_pass:
-        st.error(
-            "No hay usuarios creados aún. Define BOOTSTRAP_ADMIN_USER y BOOTSTRAP_ADMIN_PASS en Secrets para crear el primer admin."
-        )
-        st.stop()
+    pwd_hash = hash_password(admin_pass)
 
-    create_user(admin_user, admin_pass, "admin")
-
-
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if row and force:
+                # fuerza reset de password + rol admin
+                cur.execute("""
+                    update public.users
+                    set password_hash = %s,
+                        role = 'admin'
+                    where username = %s
+                """, (pwd_hash, admin_user))
+            elif not row:
+                # crea si no existe
+                cur.execute("""
+                    insert into public.users (username, password_hash, role)
+                    values (%s, %s, 'admin')
+                """, (admin_user, pwd_hash))
+        conn.commit()
 # =========================
 # Machines
 # =========================
