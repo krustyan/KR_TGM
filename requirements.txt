@@ -1,3 +1,4 @@
 streamlit
 psycopg[binary]
 bcrypt
+pandas
