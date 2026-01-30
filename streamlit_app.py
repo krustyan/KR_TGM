@@ -115,20 +115,6 @@ def get_user_by_username(username: str):
             )
             return cur.fetchone()
 
-# --- DIAGNÓSTICO TEMPORAL (BORRAR DESPUÉS) ---
-with connect() as conn:
-    with conn.cursor() as cur:
-        cur.execute("select count(*) as c from public.users")
-        st.write("users_count =", int(cur.fetchone()["c"]))
-
-        cur.execute("select id, username, role, created_at from public.users order by id")
-        st.write("users =", cur.fetchall())
-
-st.write("BOOTSTRAP_ADMIN_USER existe:", "BOOTSTRAP_ADMIN_USER" in st.secrets)
-st.write("BOOTSTRAP_ADMIN_PASS existe:", "BOOTSTRAP_ADMIN_PASS" in st.secrets)
-st.write("BOOTSTRAP_ADMIN_USER value:", st.secrets.get("BOOTSTRAP_ADMIN_USER"))
-# --- FIN DIAGNÓSTICO ---
-
 def ensure_bootstrap_admin():
     admin_user = (st.secrets.get("BOOTSTRAP_ADMIN_USER") or "").strip().lower()
     admin_pass = st.secrets.get("BOOTSTRAP_ADMIN_PASS") or ""
