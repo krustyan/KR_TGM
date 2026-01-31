@@ -3,45 +3,28 @@ import re
 import hmac
 import hashlib
 import binascii
-from datetime import date, datetime
+from datetime import date
 
 import streamlit as st
-import psycopg2
-import psycopg2.extras
+import psycopg
+from psycopg.rows import dict_row
 
 
 # ----------------------------
-# CONFIG STREAMLIT
+# STREAMLIT CONFIG
 # ----------------------------
 st.set_page_config(
     page_title="KR_TGM • Mantenciones",
     page_icon="🛠️",
     layout="wide",
 )
-
-# Oculta detalles de error en la UI (no elimina errores, solo los hace menos “debuggy”)
 st.set_option("client.showErrorDetails", False)
 
 CUSTOM_CSS = """
 <style>
-/* Sidebar más limpio */
 section[data-testid="stSidebar"] { padding-top: 0.5rem; }
-
-/* Botones más “pro” */
-div.stButton > button {
-  border-radius: 10px;
-  padding: 0.55rem 0.9rem;
-}
-
-/* Cards simples */
-.kr-card {
-  border: 1px solid rgba(255,255,255,0.12);
-  border-radius: 14px;
-  padding: 14px 14px;
-  background: rgba(255,255,255,0.03);
-}
-
-/* Títulos */
+div.stButton > button { border-radius: 10px; padding: 0.55rem 0.9rem; }
+.kr-card { border: 1px solid rgba(255,255,255,0.12); border-radius: 14px; padding: 14px; background: rgba(255,255,255,0.03); }
 .kr-title { font-size: 1.4rem; font-weight: 700; margin: 0; }
 .kr-sub { opacity: 0.75; margin-top: 0.25rem; }
 </style>
@@ -53,7 +36,6 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # DB URL
 # ----------------------------
 def get_db_url() -> str:
-    # Prioridad: secrets > env var
     if "DB_URL" in st.secrets:
         return st.secrets["DB_URL"]
     env = os.getenv("DB_URL") or os.getenv("DATABASE_URL")
@@ -66,21 +48,24 @@ DB_URL = get_db_url()
 
 
 # ----------------------------
-# CONEXIÓN DB
+# DB CONNECTION (psycopg v3)
 # ----------------------------
 def db_conn():
-    return psycopg2.connect(DB_URL)
+    # Supabase normalmente requiere SSL
+    # psycopg3 permite pasar sslmode="require"
+    return psycopg.connect(DB_URL, sslmode="require", row_factory=dict_row)
 
 
 def run_exec(sql: str, params=None):
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
+        conn.commit()
 
 
 def run_fetchall(sql: str, params=None):
     with db_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        with conn.cursor() as cur:
             cur.execute(sql, params)
             return cur.fetchall()
 
@@ -113,69 +98,71 @@ def verify_password(password: str, stored: str) -> bool:
 
 
 # ----------------------------
-# SCHEMA / INIT
+# INIT DB (CREATE TABLES)
 # ----------------------------
 def init_db():
-    # USERS
-    run_exec("""
-    CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        username TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        is_admin BOOLEAN NOT NULL DEFAULT FALSE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    """)
-    # MACHINES
-    run_exec("""
-    CREATE TABLE IF NOT EXISTS machines (
-        id_maquina TEXT PRIMARY KEY,
-        fabricante TEXT NOT NULL,
-        sector TEXT NOT NULL,
-        banco TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    """)
-    # MAINTENANCE
-    run_exec("""
-    CREATE TABLE IF NOT EXISTS mantenciones (
-        id SERIAL PRIMARY KEY,
-        id_maquina TEXT NOT NULL,
-        tipo TEXT NOT NULL,
-        descripcion TEXT NOT NULL,
-        fecha DATE NOT NULL,
-        realizado_por TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        CONSTRAINT fk_mantenciones_machine
-            FOREIGN KEY (id_maquina)
-            REFERENCES machines(id_maquina)
-            ON UPDATE CASCADE
-            ON DELETE RESTRICT
-    );
-    """)
+    """
+    Crea tablas si no existen.
+    Si tu usuario no tiene permisos CREATE en Supabase, mostrará warning y seguirá,
+    asumiendo que las tablas ya existen.
+    """
+    try:
+        run_exec("""
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
 
-    # Seed: admin si no existe ninguno
-    existing_admin = run_fetchone("SELECT id FROM users WHERE is_admin = TRUE LIMIT 1;")
-    if not existing_admin:
-        # Usuario admin por defecto
-        default_user = "admin"
-        default_pass = "Admin1234!"
-        run_exec(
-            "INSERT INTO users (username, password_hash, is_admin) VALUES (%s,%s,TRUE) ON CONFLICT (username) DO NOTHING;",
-            (default_user, hash_password(default_pass))
-        )
+        run_exec("""
+        CREATE TABLE IF NOT EXISTS machines (
+            id_maquina TEXT PRIMARY KEY,
+            fabricante TEXT NOT NULL,
+            sector TEXT NOT NULL,
+            banco TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+
+        run_exec("""
+        CREATE TABLE IF NOT EXISTS mantenciones (
+            id SERIAL PRIMARY KEY,
+            id_maquina TEXT NOT NULL,
+            tipo TEXT NOT NULL,
+            descripcion TEXT NOT NULL,
+            fecha DATE NOT NULL,
+            realizado_por TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT fk_mantenciones_machine
+                FOREIGN KEY (id_maquina)
+                REFERENCES machines(id_maquina)
+                ON UPDATE CASCADE
+                ON DELETE RESTRICT
+        );
+        """)
+
+        # Seed admin si no existe ninguno
+        existing_admin = run_fetchone("SELECT id FROM users WHERE is_admin = TRUE LIMIT 1;")
+        if not existing_admin:
+            run_exec(
+                "INSERT INTO users (username, password_hash, is_admin) VALUES (%s,%s,TRUE) ON CONFLICT (username) DO NOTHING;",
+                ("admin", hash_password("Admin1234!"))
+            )
+
+    except Exception as e:
+        st.warning("No pude ejecutar CREATE TABLE. Si las tablas ya existen, puedes ignorarlo. Detalle:")
+        st.exception(e)
 
 
 # Ejecuta init al iniciar
-try:
-    init_db()
-except Exception as e:
-    st.error("No pude inicializar la base de datos. Revisa DB_URL y permisos.")
-    st.stop()
+init_db()
 
 
 # ----------------------------
-# AUTH SESSION
+# AUTH
 # ----------------------------
 def is_logged_in() -> bool:
     return bool(st.session_state.get("user"))
@@ -199,7 +186,10 @@ def require_admin():
 
 
 def login(username: str, password: str) -> bool:
-    user = run_fetchone("SELECT id, username, password_hash, is_admin FROM users WHERE username = %s;", (username,))
+    user = run_fetchone(
+        "SELECT id, username, password_hash, is_admin FROM users WHERE username = %s;",
+        (username,)
+    )
     if not user:
         return False
     if not verify_password(password, user["password_hash"]):
@@ -217,7 +207,6 @@ def logout():
 # ----------------------------
 def sanitize_machine_id(mid: str) -> str:
     mid = (mid or "").strip()
-    # Permite letras, números, guion, underscore, punto
     mid = re.sub(r"[^A-Za-z0-9._-]", "", mid)
     return mid
 
@@ -236,7 +225,7 @@ def machine_exists(id_maquina: str) -> bool:
 
 
 # ----------------------------
-# UI: LOGIN
+# UI: LOGIN PAGE
 # ----------------------------
 def render_login():
     st.markdown('<div class="kr-card">', unsafe_allow_html=True)
@@ -262,7 +251,7 @@ def render_login():
                 else:
                     st.error("Usuario o contraseña incorrectos.")
 
-    st.info("Si es primera vez, se crea automáticamente un admin por defecto: usuario **admin** / clave **Admin1234!** (cámbiala).")
+    st.info("Si es primera vez: usuario **admin** / clave **Admin1234!** (cámbiala apenas entres).")
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -285,18 +274,14 @@ def page_maquinas():
             st.warning("No hay máquinas registradas.")
             return
 
-        # Selector buscable: streamlit permite escribir dentro del selectbox
-        machine_labels = [
-            f'{m["id_maquina"]} • {m["fabricante"]} • {m["sector"]} • {m["banco"]}'
-            for m in machines
-        ]
-        idx_map = {machine_labels[i]: machines[i] for i in range(len(machines))}
-        sel = st.selectbox("Selecciona una máquina (buscable)", machine_labels)
-
+        labels = [f'{m["id_maquina"]} • {m["fabricante"]} • {m["sector"]} • {m["banco"]}' for m in machines]
+        idx_map = {labels[i]: machines[i] for i in range(len(machines))}
+        sel = st.selectbox("Selecciona una máquina (buscable)", labels)
         m = idx_map[sel]
+
         colA, colB, colC, colD = st.columns(4)
         with colA:
-            id_maquina = st.text_input("id_maquina (PK)", value=m["id_maquina"], disabled=True)
+            st.text_input("id_maquina (PK)", value=m["id_maquina"], disabled=True)
         with colB:
             fabricante = st.text_input("fabricante", value=m["fabricante"])
         with colC:
@@ -315,23 +300,25 @@ def page_maquinas():
                     """, (fabricante.strip(), sector.strip(), banco.strip(), m["id_maquina"]))
                     st.success("Máquina actualizada.")
                     st.rerun()
-                except Exception:
-                    st.error("No se pudo actualizar. Revisa datos y permisos.")
+                except Exception as e:
+                    st.error("No se pudo actualizar.")
+                    st.exception(e)
+
         with c2:
             if st.button("Eliminar máquina", use_container_width=True):
-                # Restricción FK: si tiene mantenciones, no debería borrar (ON DELETE RESTRICT)
                 try:
                     run_exec("DELETE FROM machines WHERE id_maquina=%s;", (m["id_maquina"],))
                     st.success("Máquina eliminada.")
                     st.rerun()
-                except Exception:
-                    st.error("No se pudo eliminar. Puede tener mantenciones asociadas (restricción).")
+                except Exception as e:
+                    st.error("No se pudo eliminar (puede tener mantenciones asociadas).")
+                    st.exception(e)
+
         with c3:
-            st.caption("Nota: si la máquina tiene mantenciones, no se eliminará para mantener integridad.")
+            st.caption("Nota: si la máquina tiene mantenciones, no se eliminará (FK).")
 
         st.divider()
-        st.write("Vista rápida:")
-        st.dataframe(machines, use_container_width=True)
+        st.dataframe(machines, use_container_width=True, hide_index=True)
 
     with tab2:
         col1, col2, col3, col4 = st.columns(4)
@@ -356,8 +343,9 @@ def page_maquinas():
                     """, (nid, new_fab.strip(), new_sector.strip(), new_banco.strip()))
                     st.success("Máquina creada.")
                     st.rerun()
-                except Exception:
+                except Exception as e:
                     st.error("No se pudo crear. ¿id_maquina ya existe?")
+                    st.exception(e)
 
 
 def page_mantenciones():
@@ -373,10 +361,7 @@ def page_mantenciones():
         st.warning("Primero debes registrar máquinas.")
         return
 
-    labels = [
-        f'{m["id_maquina"]} • {m["fabricante"]} • {m["sector"]} • {m["banco"]}'
-        for m in machines
-    ]
+    labels = [f'{m["id_maquina"]} • {m["fabricante"]} • {m["sector"]} • {m["banco"]}' for m in machines]
     idx_map = {labels[i]: machines[i] for i in range(len(machines))}
 
     c1, c2, c3, c4 = st.columns([2, 1, 2, 2])
@@ -396,22 +381,23 @@ def page_mantenciones():
     if st.button("Guardar mantención", use_container_width=True):
         if not descripcion.strip():
             st.error("La descripción es obligatoria.")
-        else:
-            # VALIDACIÓN: no guardar si máquina no existe (doble: app + FK)
-            if not machine_exists(id_maquina):
-                st.error("No se puede guardar: la máquina seleccionada ya no existe.")
-            else:
-                try:
-                    run_exec("""
-                        INSERT INTO mantenciones (id_maquina, tipo, descripcion, fecha, realizado_por)
-                        VALUES (%s,%s,%s,%s,%s)
-                    """, (id_maquina, tipo, descripcion.strip(), fecha, realizado_por.strip()))
-                    st.success("Mantención registrada.")
-                    st.rerun()
-                except psycopg2.errors.ForeignKeyViolation:
-                    st.error("No se puede guardar: la máquina no existe (FK).")
-                except Exception:
-                    st.error("No se pudo guardar la mantención. Revisa permisos / DB.")
+            return
+
+        # Validación: no guardar si no existe máquina
+        if not machine_exists(id_maquina):
+            st.error("No se puede guardar: la máquina seleccionada ya no existe.")
+            return
+
+        try:
+            run_exec("""
+                INSERT INTO mantenciones (id_maquina, tipo, descripcion, fecha, realizado_por)
+                VALUES (%s,%s,%s,%s,%s)
+            """, (id_maquina, tipo, descripcion.strip(), fecha, realizado_por.strip()))
+            st.success("Mantención registrada.")
+            st.rerun()
+        except Exception as e:
+            st.error("No se pudo guardar la mantención.")
+            st.exception(e)
 
 
 def page_historial():
@@ -419,10 +405,9 @@ def page_historial():
 
     st.markdown('<div class="kr-card">', unsafe_allow_html=True)
     st.markdown('<p class="kr-title">📚 Historial</p>', unsafe_allow_html=True)
-    st.markdown('<p class="kr-sub">Historial de mantenciones con JOIN a máquinas (fabricante/sector/banco).</p>', unsafe_allow_html=True)
+    st.markdown('<p class="kr-sub">Historial con JOIN a máquinas (fabricante/sector/banco).</p>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Filtros
     c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
     with c1:
         q = st.text_input("Buscar (id_maquina / sector / banco / descripción)", "")
@@ -476,8 +461,9 @@ def page_historial():
         rows = run_fetchall(sql, params)
         st.dataframe(rows, use_container_width=True, hide_index=True)
         st.caption(f"Mostrando {len(rows)} registros (máximo 2000).")
-    except Exception:
+    except Exception as e:
         st.error("No se pudo cargar historial.")
+        st.exception(e)
 
 
 def page_usuarios_admin():
@@ -499,7 +485,7 @@ def page_usuarios_admin():
         st.dataframe(users, use_container_width=True, hide_index=True)
 
         st.divider()
-        st.write("Eliminar usuario (no recomendado si es único admin):")
+        st.write("Eliminar usuario:")
         usernames = [u["username"] for u in users]
         if usernames:
             u_sel = st.selectbox("Usuario", usernames)
@@ -511,8 +497,9 @@ def page_usuarios_admin():
                         run_exec("DELETE FROM users WHERE username=%s;", (u_sel,))
                         st.success("Usuario eliminado.")
                         st.rerun()
-                    except Exception:
+                    except Exception as e:
                         st.error("No se pudo eliminar el usuario.")
+                        st.exception(e)
 
     with tab2:
         c1, c2, c3 = st.columns([2, 2, 1])
@@ -534,8 +521,9 @@ def page_usuarios_admin():
                     """, (new_user.strip(), hash_password(new_pass), bool(new_is_admin)))
                     st.success("Usuario creado.")
                     st.rerun()
-                except Exception:
+                except Exception as e:
                     st.error("No se pudo crear. ¿Usuario ya existe?")
+                    st.exception(e)
 
         st.divider()
         st.write("Reset contraseña:")
@@ -550,31 +538,38 @@ def page_usuarios_admin():
                     try:
                         run_exec("UPDATE users SET password_hash=%s WHERE username=%s;", (hash_password(np), u))
                         st.success("Contraseña actualizada.")
-                    except Exception:
+                    except Exception as e:
                         st.error("No se pudo resetear la contraseña.")
+                        st.exception(e)
 
 
 # ----------------------------
-# MAIN NAV
+# SIDEBAR NAV
 # ----------------------------
-choice = render_sidebar_nav()
+def render_sidebar_nav():
+    u = current_user()
+    st.sidebar.markdown("### KR_TGM")
+    st.sidebar.write(f"👋 **{u['username']}**")
+    st.sidebar.caption("Mantenciones • Streamlit + Supabase")
 
-if choice == "🎰 Máquinas":
-    page_maquinas()
+    pages = ["🛠️ Mantenciones", "📚 Historial", "🎰 Máquinas"]
+    if u.get("is_admin"):
+        pages.append("👤 Usuarios (Admin)")
+    pages.append("🚪 Cerrar sesión")
 
-elif choice == "🛠️ Mantenciones":
-    page_mantenciones()
+    choice = st.sidebar.radio("Navegación", pages, index=0)
 
-elif choice == "📚 Historial":
-    page_historial()
+    if choice == "🚪 Cerrar sesión":
+        logout()
+        st.success("Sesión cerrada.")
+        st.rerun()
 
-elif choice == "👤 Usuarios (Admin)":
-    page_usuarios_admin()
-
-else:
-    page_mantenciones()
+    return choice
 
 
+# ----------------------------
+# MAIN
+# ----------------------------
 def main():
     if not is_logged_in():
         render_login()
@@ -582,14 +577,19 @@ def main():
 
     choice = render_sidebar_nav()
 
+    # ✅ BLOQUE CORREGIDO (sin elif suelto)
     if choice == "🎰 Máquinas":
         page_maquinas()
+
     elif choice == "🛠️ Mantenciones":
         page_mantenciones()
+
     elif choice == "📚 Historial":
         page_historial()
+
     elif choice == "👤 Usuarios (Admin)":
         page_usuarios_admin()
+
     else:
         page_mantenciones()
 
