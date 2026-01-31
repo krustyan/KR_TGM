@@ -1,4 +1,2 @@
 streamlit
-psycopg[binary]
-bcrypt
-pandas
+psycopg2-binary
