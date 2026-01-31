@@ -12,11 +12,7 @@ from psycopg.rows import dict_row
 # ----------------------------
 # STREAMLIT CONFIG
 # ----------------------------
-st.set_page_config(
-    page_title="KR_TGM • Mantenciones",
-    page_icon="🛠️",
-    layout="wide",
-)
+st.set_page_config(page_title="KR_TGM • Mantenciones", page_icon="🛠️", layout="wide")
 st.set_option("client.showErrorDetails", False)
 
 CUSTOM_CSS = """
@@ -114,10 +110,9 @@ def column_exists(table: str, column: str) -> bool:
 
 def ensure_users_schema():
     """
-    Si 'users' ya existe pero le faltan columnas, las agrega.
-    Evita el error 'is_admin does not exist'.
+    Asegura que exista la tabla users y las columnas mínimas que necesitamos.
+    Respeta tu esquema si ya existe (por ejemplo, role NOT NULL).
     """
-    # Si la tabla no existe, la creamos limpia
     run_exec("""
     CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -128,7 +123,6 @@ def ensure_users_schema():
     );
     """)
 
-    # Si existe pero faltan columnas, las agregamos sin destruir datos
     if not column_exists("users", "password_hash"):
         run_exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;")
 
@@ -138,14 +132,43 @@ def ensure_users_schema():
     if not column_exists("users", "created_at"):
         run_exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
 
-    # Si algunos usuarios antiguos tenían password en otra columna (por ejemplo 'password'),
-    # aquí podrías migrar manualmente. Por ahora solo garantizamos que exista password_hash.
+
+def seed_admin():
+    """
+    Inserta admin por defecto si no existe.
+    Si existe columna 'role' (NOT NULL), inserta role='admin'.
+    """
+    has_role = column_exists("users", "role")
+
+    # Si tu esquema usa role, consideramos admin si role='admin'
+    if has_role:
+        existing = run_fetchone("SELECT id FROM users WHERE role = 'admin' LIMIT 1;")
+        if not existing:
+            run_exec(
+                """
+                INSERT INTO users (username, password_hash, role)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (username) DO NOTHING;
+                """,
+                ("admin", hash_password("Admin1234!"), "admin"),
+            )
+    else:
+        existing = run_fetchone("SELECT id FROM users WHERE is_admin = TRUE LIMIT 1;")
+        if not existing:
+            run_exec(
+                """
+                INSERT INTO users (username, password_hash, is_admin)
+                VALUES (%s, %s, TRUE)
+                ON CONFLICT (username) DO NOTHING;
+                """,
+                ("admin", hash_password("Admin1234!")),
+            )
 
 
 def init_db():
     """
     Crea tablas si no existen.
-    id_maquina se define como INTEGER para coincidir con tu DB actual.
+    Mantiene id_maquina como INTEGER.
     """
     try:
         ensure_users_schema()
@@ -177,18 +200,7 @@ def init_db():
         );
         """)
 
-        # Seed admin (si no existe ningún admin)
-        # OJO: ahora is_admin siempre existe (porque ensure_users_schema lo asegura)
-        existing_admin = run_fetchone("SELECT id FROM users WHERE is_admin = TRUE LIMIT 1;")
-        if not existing_admin:
-            run_exec(
-                """
-                INSERT INTO users (username, password_hash, is_admin)
-                VALUES (%s,%s,TRUE)
-                ON CONFLICT (username) DO NOTHING;
-                """,
-                ("admin", hash_password("Admin1234!")),
-            )
+        seed_admin()
 
     except Exception as e:
         st.warning("No pude ejecutar inicialización completa (CREATE/ALTER). Si las tablas ya existen, puedes ignorarlo. Detalle:")
@@ -217,23 +229,40 @@ def require_login():
 
 def require_admin():
     require_login()
-    if not current_user().get("is_admin"):
+    u = current_user()
+    if not (u.get("is_admin") or u.get("role") == "admin"):
         st.error("Acceso solo para administradores.")
         st.stop()
 
 
 def login(username: str, password: str) -> bool:
-    user = run_fetchone(
-        "SELECT id, username, password_hash, is_admin FROM users WHERE username = %s;",
-        (username.strip(),),
-    )
-    if not user:
+    has_role = column_exists("users", "role")
+
+    if has_role:
+        user = run_fetchone(
+            "SELECT id, username, password_hash, role FROM users WHERE username = %s;",
+            (username.strip(),),
+        )
+    else:
+        user = run_fetchone(
+            "SELECT id, username, password_hash, is_admin FROM users WHERE username = %s;",
+            (username.strip(),),
+        )
+
+    if not user or not user.get("password_hash"):
         return False
-    if not user.get("password_hash"):
-        return False
+
     if not verify_password(password, user["password_hash"]):
         return False
-    st.session_state["user"] = {"id": user["id"], "username": user["username"], "is_admin": bool(user["is_admin"])}
+
+    payload = {"id": user["id"], "username": user["username"]}
+    if has_role:
+        payload["role"] = user.get("role")
+        payload["is_admin"] = (user.get("role") == "admin")
+    else:
+        payload["is_admin"] = bool(user.get("is_admin"))
+
+    st.session_state["user"] = payload
     return True
 
 
@@ -244,7 +273,7 @@ def logout():
 # ----------------------------
 # HELPERS
 # ----------------------------
-def get_all_machines():
+def run_fetch_machines():
     return run_fetchall("""
         SELECT id_maquina, fabricante, sector, banco
         FROM machines
@@ -257,15 +286,8 @@ def machine_exists(id_maquina: int) -> bool:
     return bool(row)
 
 
-def safe_int(value, default=None):
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
 # ----------------------------
-# UI: LOGIN PAGE
+# UI: LOGIN
 # ----------------------------
 def render_login():
     st.markdown('<div class="kr-card">', unsafe_allow_html=True)
@@ -284,14 +306,13 @@ def render_login():
             if not username or not password:
                 st.error("Completa usuario y contraseña.")
             else:
-                ok = login(username, password)
-                if ok:
+                if login(username, password):
                     st.success("Sesión iniciada.")
                     st.rerun()
                 else:
-                    st.error("Usuario o contraseña incorrectos (o usuario sin password_hash).")
+                    st.error("Usuario o contraseña incorrectos.")
 
-    st.info("Si es primera vez: usuario **admin** / clave **Admin1234!** (cámbiala apenas entres).")
+    st.info("Admin por defecto: usuario **admin** / clave **Admin1234!** (cámbiala apenas entres).")
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -309,7 +330,7 @@ def page_maquinas():
     tab1, tab2 = st.tabs(["📋 Listado / Editar", "➕ Crear"])
 
     with tab1:
-        machines = get_all_machines()
+        machines = run_fetch_machines()
         if not machines:
             st.warning("No hay máquinas registradas.")
             return
@@ -332,17 +353,11 @@ def page_maquinas():
         c1, c2, c3 = st.columns([1, 1, 2])
         with c1:
             if st.button("Guardar cambios", use_container_width=True):
-                try:
-                    run_exec("""
-                        UPDATE machines
-                        SET fabricante=%s, sector=%s, banco=%s
-                        WHERE id_maquina=%s
-                    """, (fabricante.strip(), sector.strip(), banco.strip(), int(m["id_maquina"])))
-                    st.success("Máquina actualizada.")
-                    st.rerun()
-                except Exception as e:
-                    st.error("No se pudo actualizar.")
-                    st.exception(e)
+                run_exec("""
+                    UPDATE machines SET fabricante=%s, sector=%s, banco=%s WHERE id_maquina=%s
+                """, (fabricante.strip(), sector.strip(), banco.strip(), int(m["id_maquina"])))
+                st.success("Máquina actualizada.")
+                st.rerun()
 
         with c2:
             if st.button("Eliminar máquina", use_container_width=True):
@@ -357,9 +372,6 @@ def page_maquinas():
         with c3:
             st.caption("Nota: si la máquina tiene mantenciones, no se eliminará (FK).")
 
-        st.divider()
-        st.dataframe(machines, use_container_width=True, hide_index=True)
-
     with tab2:
         col1, col2, col3, col4 = st.columns(4)
         with col1:
@@ -372,21 +384,16 @@ def page_maquinas():
             new_banco = st.text_input("banco", placeholder="Ej: Banco A / King Kong Cash")
 
         if st.button("Crear máquina", use_container_width=True):
-            nid = safe_int(new_id)
-            if nid is None or not new_fab.strip() or not new_sector.strip() or not new_banco.strip():
+            if not new_fab.strip() or not new_sector.strip() or not new_banco.strip():
                 st.error("Completa todos los campos.")
                 return
 
-            try:
-                run_exec("""
-                    INSERT INTO machines (id_maquina, fabricante, sector, banco)
-                    VALUES (%s,%s,%s,%s)
-                """, (nid, new_fab.strip(), new_sector.strip(), new_banco.strip()))
-                st.success("Máquina creada.")
-                st.rerun()
-            except Exception as e:
-                st.error("No se pudo crear. ¿id_maquina ya existe?")
-                st.exception(e)
+            run_exec("""
+                INSERT INTO machines (id_maquina, fabricante, sector, banco)
+                VALUES (%s,%s,%s,%s)
+            """, (int(new_id), new_fab.strip(), new_sector.strip(), new_banco.strip()))
+            st.success("Máquina creada.")
+            st.rerun()
 
 
 def page_mantenciones():
@@ -397,7 +404,7 @@ def page_mantenciones():
     st.markdown('<p class="kr-sub">Registrar mantenciones con selección buscable de máquinas.</p>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    machines = get_all_machines()
+    machines = run_fetch_machines()
     if not machines:
         st.warning("Primero debes registrar máquinas.")
         return
@@ -428,16 +435,12 @@ def page_mantenciones():
             st.error("No se puede guardar: la máquina seleccionada ya no existe.")
             return
 
-        try:
-            run_exec("""
-                INSERT INTO mantenciones (id_maquina, tipo, descripcion, fecha, realizado_por)
-                VALUES (%s,%s,%s,%s,%s)
-            """, (id_maquina, tipo, descripcion.strip(), fecha, realizado_por.strip()))
-            st.success("Mantención registrada.")
-            st.rerun()
-        except Exception as e:
-            st.error("No se pudo guardar la mantención.")
-            st.exception(e)
+        run_exec("""
+            INSERT INTO mantenciones (id_maquina, tipo, descripcion, fecha, realizado_por)
+            VALUES (%s,%s,%s,%s,%s)
+        """, (id_maquina, tipo, descripcion.strip(), fecha, realizado_por.strip()))
+        st.success("Mantención registrada.")
+        st.rerun()
 
 
 def page_historial():
@@ -445,7 +448,7 @@ def page_historial():
 
     st.markdown('<div class="kr-card">', unsafe_allow_html=True)
     st.markdown('<p class="kr-title">📚 Historial</p>', unsafe_allow_html=True)
-    st.markdown('<p class="kr-sub">Historial con JOIN a máquinas (fabricante/sector/banco).</p>', unsafe_allow_html=True)
+    st.markdown('<p class="kr-sub">Historial con JOIN a máquinas.</p>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
@@ -496,57 +499,13 @@ def page_historial():
         ORDER BY m.fecha DESC, m.id DESC
         LIMIT 2000;
     """
-
-    try:
-        rows = run_fetchall(sql, params)
-        st.dataframe(rows, use_container_width=True, hide_index=True)
-        st.caption(f"Mostrando {len(rows)} registros (máximo 2000).")
-    except Exception as e:
-        st.error("No se pudo cargar historial.")
-        st.exception(e)
+    rows = run_fetchall(sql, params)
+    st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
 def page_usuarios_admin():
     require_admin()
-
-    st.markdown('<div class="kr-card">', unsafe_allow_html=True)
-    st.markdown('<p class="kr-title">👤 Usuarios (Admin)</p>', unsafe_allow_html=True)
-    st.markdown('<p class="kr-sub">Crear usuarios, resetear claves.</p>', unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    tab1, tab2 = st.tabs(["📋 Usuarios", "➕ Crear / Reset"])
-
-    with tab1:
-        users = run_fetchall("""
-            SELECT id, username, is_admin, created_at
-            FROM users
-            ORDER BY is_admin DESC, username ASC;
-        """)
-        st.dataframe(users, use_container_width=True, hide_index=True)
-
-    with tab2:
-        c1, c2, c3 = st.columns([2, 2, 1])
-        with c1:
-            new_user = st.text_input("Nuevo usuario", key="new_user")
-        with c2:
-            new_pass = st.text_input("Nueva contraseña", type="password", key="new_pass")
-        with c3:
-            new_is_admin = st.checkbox("Admin", value=False, key="new_is_admin")
-
-        if st.button("Crear usuario", use_container_width=True):
-            if not new_user.strip() or not new_pass:
-                st.error("Usuario y contraseña son obligatorios.")
-                return
-            try:
-                run_exec("""
-                    INSERT INTO users (username, password_hash, is_admin)
-                    VALUES (%s,%s,%s)
-                """, (new_user.strip(), hash_password(new_pass), bool(new_is_admin)))
-                st.success("Usuario creado.")
-                st.rerun()
-            except Exception as e:
-                st.error("No se pudo crear. ¿Usuario ya existe?")
-                st.exception(e)
+    st.write("👤 Usuarios admin (pendiente de UI pro).")
 
 
 # ----------------------------
@@ -558,10 +517,9 @@ def render_sidebar_nav():
     st.sidebar.write(f"👋 **{u['username']}**")
     st.sidebar.caption("Mantenciones • Streamlit + Supabase")
 
-    pages = ["🛠️ Mantenciones", "📚 Historial", "🎰 Máquinas"]
-    if u.get("is_admin"):
-        pages.append("👤 Usuarios (Admin)")
-    pages.append("🚪 Cerrar sesión")
+    pages = ["🛠️ Mantenciones", "📚 Historial", "🎰 Máquinas", "🚪 Cerrar sesión"]
+    if u.get("is_admin") or u.get("role") == "admin":
+        pages.insert(3, "👤 Usuarios (Admin)")
 
     choice = st.sidebar.radio("Navegación", pages, index=0)
 
