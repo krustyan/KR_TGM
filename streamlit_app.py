@@ -1,556 +1,601 @@
-# -*- coding: utf-8 -*-
 import os
-import datetime as dt
+import re
+import hmac
+import hashlib
+import binascii
+from datetime import date, datetime
 
 import streamlit as st
-import pandas as pd
-import bcrypt
-import psycopg
-from psycopg.rows import dict_row
-
-st.set_page_config(page_title="KR_TGM • Mantenciones e Historial", layout="wide")
+import psycopg2
+import psycopg2.extras
 
 
-# =========================
-# DB / Secrets
-# =========================
+# ----------------------------
+# CONFIG STREAMLIT
+# ----------------------------
+st.set_page_config(
+    page_title="KR_TGM • Mantenciones",
+    page_icon="🛠️",
+    layout="wide",
+)
+
+# Oculta detalles de error en la UI (no elimina errores, solo los hace menos “debuggy”)
+st.set_option("client.showErrorDetails", False)
+
+CUSTOM_CSS = """
+<style>
+/* Sidebar más limpio */
+section[data-testid="stSidebar"] { padding-top: 0.5rem; }
+
+/* Botones más “pro” */
+div.stButton > button {
+  border-radius: 10px;
+  padding: 0.55rem 0.9rem;
+}
+
+/* Cards simples */
+.kr-card {
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 14px;
+  padding: 14px 14px;
+  background: rgba(255,255,255,0.03);
+}
+
+/* Títulos */
+.kr-title { font-size: 1.4rem; font-weight: 700; margin: 0; }
+.kr-sub { opacity: 0.75; margin-top: 0.25rem; }
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+
+# ----------------------------
+# DB URL
+# ----------------------------
 def get_db_url() -> str:
+    # Prioridad: secrets > env var
     if "DB_URL" in st.secrets:
         return st.secrets["DB_URL"]
-    env = os.getenv("DB_URL")
+    env = os.getenv("DB_URL") or os.getenv("DATABASE_URL")
     if env:
         return env
-    raise KeyError("DB_URL no está definido en Secrets (ni en variable de entorno).")
+    raise RuntimeError("No se encontró DB_URL en st.secrets ni en variables de entorno.")
 
 
-def connect():
-    return psycopg.connect(get_db_url(), row_factory=dict_row, connect_timeout=10)
+DB_URL = get_db_url()
 
 
-def hash_password(plain: str) -> str:
-    hashed = bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt(rounds=12))
-    return hashed.decode("utf-8")
+# ----------------------------
+# CONEXIÓN DB
+# ----------------------------
+def db_conn():
+    return psycopg2.connect(DB_URL)
 
 
-def verify_password(plain: str, hashed: str) -> bool:
+def run_exec(sql: str, params=None):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+
+
+def run_fetchall(sql: str, params=None):
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
+
+
+def run_fetchone(sql: str, params=None):
+    rows = run_fetchall(sql, params)
+    return rows[0] if rows else None
+
+
+# ----------------------------
+# PASSWORD HASH (PBKDF2)
+# ----------------------------
+def hash_password(password: str, salt: bytes = None) -> str:
+    if salt is None:
+        salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000)
+    return f"pbkdf2_sha256$120000${binascii.hexlify(salt).decode()}${binascii.hexlify(dk).decode()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
     try:
-        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+        algo, iters, salt_hex, dk_hex = stored.split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        salt = binascii.unhexlify(salt_hex)
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iters))
+        return hmac.compare_digest(binascii.hexlify(dk).decode(), dk_hex)
     except Exception:
         return False
 
 
-# =========================
-# Introspection helpers (evita UndefinedColumn)
-# =========================
-@st.cache_data(ttl=60, show_spinner=False)
-def table_columns(schema: str, table: str) -> set[str]:
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                select column_name
-                from information_schema.columns
-                where table_schema = %s and table_name = %s
-                """,
-                (schema, table),
-            )
-            return {r["column_name"] for r in cur.fetchall()}
+# ----------------------------
+# SCHEMA / INIT
+# ----------------------------
+def init_db():
+    # USERS
+    run_exec("""
+    CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """)
+    # MACHINES
+    run_exec("""
+    CREATE TABLE IF NOT EXISTS machines (
+        id_maquina TEXT PRIMARY KEY,
+        fabricante TEXT NOT NULL,
+        sector TEXT NOT NULL,
+        banco TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """)
+    # MAINTENANCE
+    run_exec("""
+    CREATE TABLE IF NOT EXISTS mantenciones (
+        id SERIAL PRIMARY KEY,
+        id_maquina TEXT NOT NULL,
+        tipo TEXT NOT NULL,
+        descripcion TEXT NOT NULL,
+        fecha DATE NOT NULL,
+        realizado_por TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT fk_mantenciones_machine
+            FOREIGN KEY (id_maquina)
+            REFERENCES machines(id_maquina)
+            ON UPDATE CASCADE
+            ON DELETE RESTRICT
+    );
+    """)
+
+    # Seed: admin si no existe ninguno
+    existing_admin = run_fetchone("SELECT id FROM users WHERE is_admin = TRUE LIMIT 1;")
+    if not existing_admin:
+        # Usuario admin por defecto
+        default_user = "admin"
+        default_pass = "Admin1234!"
+        run_exec(
+            "INSERT INTO users (username, password_hash, is_admin) VALUES (%s,%s,TRUE) ON CONFLICT (username) DO NOTHING;",
+            (default_user, hash_password(default_pass))
+        )
 
 
-def safe_select(schema: str, table: str, wanted: list[str], search: str,
-                search_cols: list[str], order_candidates: list[str]):
-    cols = table_columns(schema, table)
-
-    select_cols = [c for c in wanted if c in cols]
-    if not select_cols:
-        # fallback: muestra algo sin romper
-        select_cols = (["id"] if "id" in cols else []) + [c for c in sorted(cols) if c != "id"][:8]
-        if not select_cols:
-            return [], [], cols
-
-    q = f"select {', '.join(select_cols)} from {schema}.{table}"
-    params = []
-
-    like_cols = [c for c in search_cols if c in cols]
-    if search.strip() and like_cols:
-        q += " where " + " or ".join([f"{c} ilike %s" for c in like_cols])
-        s = f"%{search.strip()}%"
-        params = [s] * len(like_cols)
-
-    order_by = next((c for c in order_candidates if c in cols), select_cols[0])
-    q += f" order by {order_by}"
-
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(q, tuple(params))
-            rows = cur.fetchall()
-
-    return rows, select_cols, cols
+# Ejecuta init al iniciar
+try:
+    init_db()
+except Exception as e:
+    st.error("No pude inicializar la base de datos. Revisa DB_URL y permisos.")
+    st.stop()
 
 
-# =========================
-# DB Setup (crea + agrega columnas clave)
-# =========================
-def db_prepare():
-    with connect() as conn:
-        with conn.cursor() as cur:
-            # users
-            cur.execute("""
-            create table if not exists public.users (
-                id bigserial primary key,
-                username text unique not null,
-                password_hash text not null,
-                role text not null default 'read',
-                created_at timestamptz not null default now()
-            );
-            """)
-
-            # machines (mínimo)
-            cur.execute("""
-            create table if not exists public.machines (
-                id bigserial primary key,
-                created_at timestamptz not null default now()
-            );
-            """)
-
-            # columnas operativas principales
-            cur.execute("alter table public.machines add column if not exists id_maquina text;")
-            cur.execute("alter table public.machines add column if not exists fabricante text;")
-            cur.execute("alter table public.machines add column if not exists sector text;")
-            cur.execute("alter table public.machines add column if not exists banco text;")
-
-            # opcionales
-            cur.execute("alter table public.machines add column if not exists modelo text;")
-            cur.execute("alter table public.machines add column if not exists serie text;")
-            cur.execute("alter table public.machines add column if not exists estado text not null default 'activa';")
-
-            # unique por id_maquina (si usas ese ID como clave)
-            try:
-                cur.execute("create unique index if not exists machines_id_maquina_uidx on public.machines(id_maquina);")
-            except Exception:
-                pass
-
-            # maintenance (mínimo)
-            cur.execute("""
-            create table if not exists public.maintenance (
-                id bigserial primary key,
-                created_at timestamptz not null default now()
-            );
-            """)
-
-            # columnas estándar de mantención
-            cur.execute("alter table public.maintenance add column if not exists id_maquina text;")
-            cur.execute("alter table public.maintenance add column if not exists tipo text not null default 'preventiva';")
-            cur.execute("alter table public.maintenance add column if not exists estado text not null default 'pendiente';")
-            cur.execute("alter table public.maintenance add column if not exists fecha_programada date;")
-            cur.execute("alter table public.maintenance add column if not exists fecha_ejecucion date;")
-            cur.execute("alter table public.maintenance add column if not exists tecnico text;")
-            cur.execute("alter table public.maintenance add column if not exists detalle text;")
-
-        conn.commit()
-
-    table_columns.clear()
+# ----------------------------
+# AUTH SESSION
+# ----------------------------
+def is_logged_in() -> bool:
+    return bool(st.session_state.get("user"))
 
 
-# =========================
-# Auth ops
-# =========================
-def get_user_by_username(username: str):
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "select id, username, password_hash, role from public.users where username = %s",
-                (username.strip().lower(),),
-            )
-            return cur.fetchone()
+def current_user():
+    return st.session_state.get("user")
 
 
-def create_user(username: str, plain_password: str, role: str):
-    username = username.strip().lower()
-    pwd_hash = hash_password(plain_password)
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "insert into public.users (username, password_hash, role) values (%s, %s, %s)",
-                (username, pwd_hash, role),
-            )
-        conn.commit()
+def require_login():
+    if not is_logged_in():
+        st.warning("Debes iniciar sesión.")
+        st.stop()
 
 
-def ensure_bootstrap_admin():
-    admin_user = (st.secrets.get("BOOTSTRAP_ADMIN_USER") or "").strip().lower()
-    admin_pass = st.secrets.get("BOOTSTRAP_ADMIN_PASS") or ""
-    force = str(st.secrets.get("BOOTSTRAP_FORCE", "false")).lower() in ("1", "true", "yes")
+def require_admin():
+    require_login()
+    if not current_user().get("is_admin"):
+        st.error("Acceso solo para administradores.")
+        st.stop()
 
-    if not admin_user or not admin_pass:
+
+def login(username: str, password: str) -> bool:
+    user = run_fetchone("SELECT id, username, password_hash, is_admin FROM users WHERE username = %s;", (username,))
+    if not user:
+        return False
+    if not verify_password(password, user["password_hash"]):
+        return False
+    st.session_state["user"] = {"id": user["id"], "username": user["username"], "is_admin": user["is_admin"]}
+    return True
+
+
+def logout():
+    st.session_state["user"] = None
+
+
+# ----------------------------
+# HELPERS
+# ----------------------------
+def sanitize_machine_id(mid: str) -> str:
+    mid = (mid or "").strip()
+    # Permite letras, números, guion, underscore, punto
+    mid = re.sub(r"[^A-Za-z0-9._-]", "", mid)
+    return mid
+
+
+def get_all_machines():
+    return run_fetchall("""
+        SELECT id_maquina, fabricante, sector, banco
+        FROM machines
+        ORDER BY id_maquina;
+    """)
+
+
+def machine_exists(id_maquina: str) -> bool:
+    row = run_fetchone("SELECT id_maquina FROM machines WHERE id_maquina = %s;", (id_maquina,))
+    return bool(row)
+
+
+# ----------------------------
+# UI: LOGIN
+# ----------------------------
+def render_login():
+    st.markdown('<div class="kr-card">', unsafe_allow_html=True)
+    st.markdown('<p class="kr-title">🔐 KR_TGM • Login</p>', unsafe_allow_html=True)
+    st.markdown('<p class="kr-sub">Ingresa tus credenciales para continuar.</p>', unsafe_allow_html=True)
+
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        username = st.text_input("Usuario", key="login_user")
+    with c2:
+        password = st.text_input("Contraseña", type="password", key="login_pass")
+    with c3:
+        st.write("")
+        st.write("")
+        if st.button("Ingresar", use_container_width=True):
+            if not username or not password:
+                st.error("Completa usuario y contraseña.")
+            else:
+                ok = login(username.strip(), password)
+                if ok:
+                    st.success("Sesión iniciada.")
+                    st.rerun()
+                else:
+                    st.error("Usuario o contraseña incorrectos.")
+
+    st.info("Si es primera vez, se crea automáticamente un admin por defecto: usuario **admin** / clave **Admin1234!** (cámbiala).")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ----------------------------
+# PAGES
+# ----------------------------
+def page_maquinas():
+    require_login()
+
+    st.markdown('<div class="kr-card">', unsafe_allow_html=True)
+    st.markdown('<p class="kr-title">🎰 Máquinas</p>', unsafe_allow_html=True)
+    st.markdown('<p class="kr-sub">Gestiona id_maquina, fabricante, sector y banco.</p>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    tab1, tab2 = st.tabs(["📋 Listado / Editar", "➕ Crear"])
+
+    with tab1:
+        machines = get_all_machines()
+        if not machines:
+            st.warning("No hay máquinas registradas.")
+            return
+
+        # Selector buscable: streamlit permite escribir dentro del selectbox
+        machine_labels = [
+            f'{m["id_maquina"]} • {m["fabricante"]} • {m["sector"]} • {m["banco"]}'
+            for m in machines
+        ]
+        idx_map = {machine_labels[i]: machines[i] for i in range(len(machines))}
+        sel = st.selectbox("Selecciona una máquina (buscable)", machine_labels)
+
+        m = idx_map[sel]
+        colA, colB, colC, colD = st.columns(4)
+        with colA:
+            id_maquina = st.text_input("id_maquina (PK)", value=m["id_maquina"], disabled=True)
+        with colB:
+            fabricante = st.text_input("fabricante", value=m["fabricante"])
+        with colC:
+            sector = st.text_input("sector", value=m["sector"])
+        with colD:
+            banco = st.text_input("banco", value=m["banco"])
+
+        c1, c2, c3 = st.columns([1, 1, 2])
+        with c1:
+            if st.button("Guardar cambios", use_container_width=True):
+                try:
+                    run_exec("""
+                        UPDATE machines
+                        SET fabricante=%s, sector=%s, banco=%s
+                        WHERE id_maquina=%s
+                    """, (fabricante.strip(), sector.strip(), banco.strip(), m["id_maquina"]))
+                    st.success("Máquina actualizada.")
+                    st.rerun()
+                except Exception:
+                    st.error("No se pudo actualizar. Revisa datos y permisos.")
+        with c2:
+            if st.button("Eliminar máquina", use_container_width=True):
+                # Restricción FK: si tiene mantenciones, no debería borrar (ON DELETE RESTRICT)
+                try:
+                    run_exec("DELETE FROM machines WHERE id_maquina=%s;", (m["id_maquina"],))
+                    st.success("Máquina eliminada.")
+                    st.rerun()
+                except Exception:
+                    st.error("No se pudo eliminar. Puede tener mantenciones asociadas (restricción).")
+        with c3:
+            st.caption("Nota: si la máquina tiene mantenciones, no se eliminará para mantener integridad.")
+
+        st.divider()
+        st.write("Vista rápida:")
+        st.dataframe(machines, use_container_width=True)
+
+    with tab2:
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            new_id = st.text_input("Nuevo id_maquina")
+        with col2:
+            new_fab = st.text_input("fabricante", placeholder="IGT / Novomatic / etc.")
+        with col3:
+            new_sector = st.text_input("sector", placeholder="Ej: Terraza / Sala Principal")
+        with col4:
+            new_banco = st.text_input("banco", placeholder="Ej: Banco A / King Kong Cash")
+
+        if st.button("Crear máquina", use_container_width=True):
+            nid = sanitize_machine_id(new_id)
+            if not nid or not new_fab or not new_sector or not new_banco:
+                st.error("Completa todos los campos.")
+            else:
+                try:
+                    run_exec("""
+                        INSERT INTO machines (id_maquina, fabricante, sector, banco)
+                        VALUES (%s,%s,%s,%s)
+                    """, (nid, new_fab.strip(), new_sector.strip(), new_banco.strip()))
+                    st.success("Máquina creada.")
+                    st.rerun()
+                except Exception:
+                    st.error("No se pudo crear. ¿id_maquina ya existe?")
+
+
+def page_mantenciones():
+    require_login()
+
+    st.markdown('<div class="kr-card">', unsafe_allow_html=True)
+    st.markdown('<p class="kr-title">🛠️ Mantenciones</p>', unsafe_allow_html=True)
+    st.markdown('<p class="kr-sub">Registrar mantenciones con selección buscable de máquinas.</p>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    machines = get_all_machines()
+    if not machines:
+        st.warning("Primero debes registrar máquinas.")
         return
 
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute("select id from public.users where username = %s", (admin_user,))
-            row = cur.fetchone()
+    labels = [
+        f'{m["id_maquina"]} • {m["fabricante"]} • {m["sector"]} • {m["banco"]}'
+        for m in machines
+    ]
+    idx_map = {labels[i]: machines[i] for i in range(len(machines))}
 
-    pwd_hash = hash_password(admin_pass)
+    c1, c2, c3, c4 = st.columns([2, 1, 2, 2])
+    with c1:
+        sel_label = st.selectbox("Máquina (buscable)", labels)
+        sel_machine = idx_map[sel_label]
+        id_maquina = sel_machine["id_maquina"]
+    with c2:
+        fecha = st.date_input("Fecha", value=date.today())
+    with c3:
+        tipo = st.selectbox("Tipo", ["Preventiva", "Correctiva", "Revisión", "Software", "Otro"])
+    with c4:
+        realizado_por = st.text_input("Realizado por", value=current_user()["username"])
 
-    with connect() as conn:
-        with conn.cursor() as cur:
-            if row and force:
-                cur.execute("""
-                    update public.users
-                    set password_hash = %s,
-                        role = 'admin'
-                    where username = %s
-                """, (pwd_hash, admin_user))
-            elif not row:
-                cur.execute("""
-                    insert into public.users (username, password_hash, role)
-                    values (%s, %s, 'admin')
-                """, (admin_user, pwd_hash))
-        conn.commit()
+    descripcion = st.text_area("Descripción", height=120, placeholder="Detalle de la mantención, falla, acción realizada, repuestos, etc.")
 
-
-# =========================
-# Machines ops
-# =========================
-def machines_list(search: str = ""):
-    wanted = ["id_maquina", "fabricante", "sector", "banco", "modelo", "serie", "estado", "created_at"]
-    rows, shown, cols = safe_select(
-        schema="public",
-        table="machines",
-        wanted=wanted,
-        search=search,
-        search_cols=["id_maquina", "fabricante", "sector", "banco", "modelo"],
-        order_candidates=["id_maquina", "created_at", "id"],
-    )
-    return rows, shown, cols
-
-
-def machine_get_by_id_maquina(id_maquina: str):
-    cols = table_columns("public", "machines")
-    if "id_maquina" not in cols:
-        return None
-
-    wanted = ["id_maquina", "fabricante", "sector", "banco", "modelo", "serie", "estado", "created_at"]
-    select_cols = [c for c in wanted if c in cols]
-    q = f"select {', '.join(select_cols)} from public.machines where id_maquina = %s"
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(q, (id_maquina,))
-            return cur.fetchone()
-
-
-def machine_upsert(id_maquina: str, fabricante: str, sector: str, banco: str, modelo: str, serie: str, estado: str):
-    cols = table_columns("public", "machines")
-    if "id_maquina" not in cols:
-        raise RuntimeError("La tabla public.machines no tiene columna 'id_maquina'.")
-
-    # asegura unique index
-    with connect() as conn:
-        with conn.cursor() as cur:
-            try:
-                cur.execute("create unique index if not exists machines_id_maquina_uidx on public.machines(id_maquina);")
-            except Exception:
-                pass
-        conn.commit()
-
-    data = {
-        "id_maquina": id_maquina,
-        "fabricante": fabricante,
-        "sector": sector,
-        "banco": banco,
-        "modelo": modelo,
-        "serie": serie,
-        "estado": estado,
-    }
-
-    insert_cols = [k for k in data.keys() if k in cols]
-    insert_vals = [data[k] for k in insert_cols]
-    set_cols = [c for c in insert_cols if c != "id_maquina"]
-    set_clause = ", ".join([f"{c}=excluded.{c}" for c in set_cols]) if set_cols else ""
-
-    q = f"""
-        insert into public.machines ({", ".join(insert_cols)})
-        values ({", ".join(["%s"] * len(insert_cols))})
-        on conflict (id_maquina) do update
-        set {set_clause}
-    """
-    if not set_cols:
-        q = f"""
-            insert into public.machines ({", ".join(insert_cols)})
-            values ({", ".join(["%s"] * len(insert_cols))})
-            on conflict (id_maquina) do nothing
-        """
-
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(q, tuple(insert_vals))
-        conn.commit()
-
-
-# =========================
-# Maintenance ops
-# =========================
-def maintenance_list(status_filter: str = "todas", search_id: str = ""):
-    cols = table_columns("public", "maintenance")
-    wanted = ["id", "id_maquina", "tipo", "estado", "fecha_programada", "fecha_ejecucion", "tecnico", "detalle", "created_at"]
-    select_cols = [c for c in wanted if c in cols]
-    if not select_cols:
-        select_cols = (["id"] if "id" in cols else []) + [c for c in sorted(cols) if c != "id"][:8]
-
-    q = f"select {', '.join(select_cols)} from public.maintenance where 1=1"
-    params = []
-
-    if status_filter != "todas" and "estado" in cols:
-        q += " and estado = %s"
-        params.append(status_filter)
-
-    if search_id.strip() and "id_maquina" in cols:
-        q += " and id_maquina ilike %s"
-        params.append(f"%{search_id.strip()}%")
-
-    order_by = "created_at" if "created_at" in cols else ("id" if "id" in cols else select_cols[0])
-    q += f" order by {order_by} desc"
-
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(q, tuple(params))
-            return cur.fetchall(), select_cols, cols
-
-
-def maintenance_create(id_maquina: str, tipo: str, estado: str, fecha_programada, fecha_ejecucion, tecnico: str, detalle: str):
-    cols = table_columns("public", "maintenance")
-    data = {
-        "id_maquina": id_maquina,
-        "tipo": tipo,
-        "estado": estado,
-        "fecha_programada": fecha_programada,
-        "fecha_ejecucion": fecha_ejecucion,
-        "tecnico": tecnico,
-        "detalle": detalle,
-    }
-
-    insert_cols = [k for k in data.keys() if k in cols]
-    if not insert_cols:
-        raise RuntimeError("La tabla public.maintenance no tiene columnas compatibles para insertar.")
-    insert_vals = [data[k] for k in insert_cols]
-
-    q = f"insert into public.maintenance ({', '.join(insert_cols)}) values ({', '.join(['%s'] * len(insert_cols))})"
-
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(q, tuple(insert_vals))
-        conn.commit()
-
-
-# =========================
-# Boot
-# =========================
-st.title("🛠️ KR_TGM • Mantenciones e Historial")
-st.caption("Registro de máquinas, mantenciones e historial (Supabase + Streamlit Cloud)")
-
-try:
-    db_prepare()
-    ensure_bootstrap_admin()
-except Exception as e:
-    st.error("No se pudo preparar la base de datos. Revisa DB_URL en Secrets.")
-    st.info(f"Detalle técnico: {type(e).__name__}: {e}")
-    st.stop()
-
-
-# =========================
-# Session helpers
-# =========================
-def logout():
-    for k in ["auth", "user_id", "username", "role"]:
-        st.session_state.pop(k, None)
-    st.rerun()
-
-
-# =========================
-# Sidebar
-# =========================
-with st.sidebar:
-    st.subheader("Sesión")
-    if st.session_state.get("auth"):
-        st.success(f"{st.session_state['username']} ({st.session_state['role']})")
-        if st.button("Cerrar sesión", use_container_width=True):
-            logout()
-    else:
-        st.info("Inicia sesión para continuar")
-
-
-# =========================
-# Login
-# =========================
-if not st.session_state.get("auth"):
-    st.subheader("Iniciar sesión")
-    username = st.text_input("Usuario", placeholder="cristian").strip().lower()
-    password = st.text_input("Contraseña", type="password")
-
-    if st.button("Entrar", use_container_width=True):
-        u = get_user_by_username(username)
-        if not u:
-            st.error("Usuario no existe.")
-        elif not verify_password(password, u["password_hash"]):
-            st.error("Contraseña incorrecta.")
+    if st.button("Guardar mantención", use_container_width=True):
+        if not descripcion.strip():
+            st.error("La descripción es obligatoria.")
         else:
-            st.session_state["auth"] = True
-            st.session_state["user_id"] = u["id"]
-            st.session_state["username"] = u["username"]
-            st.session_state["role"] = u["role"]
-            st.rerun()
-
-    st.stop()
-
-
-# =========================
-# Main App
-# =========================
-role = st.session_state.get("role", "read")
-
-# Claves ASCII (sin emojis) para evitar problemas de encoding/sintaxis
-MENU = [
-    ("machines", "🎰 Máquinas"),
-    ("maintenance", "🛠 Mantenciones"),
-    ("history", "📜 Historial"),
-]
-if role == "admin":
-    MENU.append(("admin", "⚙️ Administración"))
-
-label_by_key = {k: v for k, v in MENU}
-keys = [k for k, _ in MENU]
-labels = [v for _, v in MENU]
-
-choice_label = st.sidebar.radio("Menú", labels)
-page = next(k for k, v in MENU if v == choice_label)
-
-# ---- Máquinas
-if page == "machines":
-    st.subheader("Máquinas")
-
-    search = st.text_input("Buscar", placeholder="ID máquina, fabricante, sector, banco, modelo...")
-
-    rows, shown, cols = machines_list(search)
-    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=shown)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-    if role == "admin":
-        with st.expander("🔎 Diagnóstico tabla public.machines (solo admin)"):
-            st.write("Columnas reales:", sorted(list(cols)))
-            st.write("Columnas mostradas:", shown)
-
-    st.markdown("---")
-    st.markdown("### Crear / Editar máquina (por ID Máquina)")
-    can_edit = role in ("admin", "supervisor")
-    if not can_edit:
-        st.info("Tu rol no permite editar máquinas.")
-    else:
-        idq = st.text_input("ID Máquina (ej: 32045)").strip()
-        current = machine_get_by_id_maquina(idq) if idq else {}
-
-        fabricante = st.text_input("Fabricante", value=(current.get("fabricante") or "") if current else "")
-        sector = st.text_input("Sector", value=(current.get("sector") or "") if current else "")
-        banco = st.text_input("Banco", value=(current.get("banco") or "") if current else "")
-        modelo = st.text_input("Modelo", value=(current.get("modelo") or "") if current else "")
-        serie = st.text_input("Serie", value=(current.get("serie") or "") if current else "")
-
-        estado_opts = ["activa", "fuera_servicio", "baja"]
-        current_estado = (current.get("estado") or "activa") if current else "activa"
-        idx = estado_opts.index(current_estado) if current_estado in estado_opts else 0
-        estado = st.selectbox("Estado", estado_opts, index=idx)
-
-        if st.button("Guardar máquina", use_container_width=True):
-            if not idq:
-                st.error("ID Máquina es obligatorio.")
+            # VALIDACIÓN: no guardar si máquina no existe (doble: app + FK)
+            if not machine_exists(id_maquina):
+                st.error("No se puede guardar: la máquina seleccionada ya no existe.")
             else:
                 try:
-                    machine_upsert(idq, fabricante, sector, banco, modelo, serie, estado)
-                    table_columns.clear()
-                    st.success("Guardado.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"No se pudo guardar: {type(e).__name__}: {e}")
-
-# ---- Mantenciones
-elif page == "maintenance":
-    st.subheader("Mantenciones")
-
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        status_filter = st.selectbox("Estado", ["todas", "pendiente", "en_proceso", "realizada", "cancelada"])
-    with col2:
-        search_id = st.text_input("Filtrar por ID Máquina", placeholder="32045 / 10.123 / etc...")
-
-    mrows, shown, cols = maintenance_list(status_filter=status_filter, search_id=search_id)
-    mdf = pd.DataFrame(mrows) if mrows else pd.DataFrame(columns=shown)
-    st.dataframe(mdf, use_container_width=True, hide_index=True)
-
-    if role == "admin":
-        with st.expander("🔎 Diagnóstico tabla public.maintenance (solo admin)"):
-            st.write("Columnas reales:", sorted(list(cols)))
-            st.write("Columnas mostradas:", shown)
-
-    st.markdown("---")
-    st.markdown("### Crear mantención")
-    can_write = role in ("admin", "supervisor", "tecnico")
-    if not can_write:
-        st.info("Tu rol no permite registrar mantenciones.")
-    else:
-        id_maquina = st.text_input("ID Máquina", key="mt_id").strip()
-        tipo = st.selectbox("Tipo", ["preventiva", "correctiva", "upgrade", "inspeccion"], index=0)
-        estado = st.selectbox("Estado", ["pendiente", "en_proceso", "realizada", "cancelada"], index=0)
-        fecha_prog = st.date_input("Fecha programada", value=dt.date.today())
-
-        # opcional: permitir vacío
-        fecha_ejec = st.date_input("Fecha ejecución", value=None)
-
-        tecnico = st.text_input("Técnico", value=st.session_state.get("username", ""))
-        detalle = st.text_area("Detalle", height=120)
-
-        if st.button("Guardar mantención", use_container_width=True):
-            if not id_maquina:
-                st.error("ID Máquina es obligatorio.")
-            else:
-                try:
-                    maintenance_create(id_maquina, tipo, estado, fecha_prog, fecha_ejec, tecnico, detalle)
-                    table_columns.clear()
+                    run_exec("""
+                        INSERT INTO mantenciones (id_maquina, tipo, descripcion, fecha, realizado_por)
+                        VALUES (%s,%s,%s,%s,%s)
+                    """, (id_maquina, tipo, descripcion.strip(), fecha, realizado_por.strip()))
                     st.success("Mantención registrada.")
                     st.rerun()
-                except Exception as e:
-                    st.error(f"No se pudo guardar: {type(e).__name__}: {e}")
+                except psycopg2.errors.ForeignKeyViolation:
+                    st.error("No se puede guardar: la máquina no existe (FK).")
+                except Exception:
+                    st.error("No se pudo guardar la mantención. Revisa permisos / DB.")
 
-# ---- Historial
-elif page == "history":
-    st.subheader("Historial")
-    mrows, shown, _ = maintenance_list(status_filter="todas", search_id="")
-    hdf = pd.DataFrame(mrows) if mrows else pd.DataFrame(columns=shown)
-    st.dataframe(hdf.head(300), use_container_width=True, hide_index=True)
 
-# ---- Administración
-elif page == "admin":
-    st.subheader("Administración • Usuarios (solo admin)")
+def page_historial():
+    require_login()
 
-    st.markdown("### Crear usuario")
-    new_user = st.text_input("Nuevo usuario").strip().lower()
-    new_pass = st.text_input("Nueva contraseña", type="password")
-    new_role = st.selectbox("Rol", ["admin", "supervisor", "tecnico", "read"], index=3)
+    st.markdown('<div class="kr-card">', unsafe_allow_html=True)
+    st.markdown('<p class="kr-title">📚 Historial</p>', unsafe_allow_html=True)
+    st.markdown('<p class="kr-sub">Historial de mantenciones con JOIN a máquinas (fabricante/sector/banco).</p>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    if st.button("Crear usuario", use_container_width=True):
-        if not new_user or not new_pass:
-            st.error("Completa usuario y contraseña.")
-        else:
-            try:
-                create_user(new_user, new_pass, new_role)
-                st.success("Usuario creado.")
-            except Exception as e:
-                st.error(f"No se pudo crear: {type(e).__name__}: {e}")
+    # Filtros
+    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    with c1:
+        q = st.text_input("Buscar (id_maquina / sector / banco / descripción)", "")
+    with c2:
+        tipo = st.selectbox("Tipo", ["(Todos)", "Preventiva", "Correctiva", "Revisión", "Software", "Otro"])
+    with c3:
+        desde = st.date_input("Desde", value=date.today().replace(day=1))
+    with c4:
+        hasta = st.date_input("Hasta", value=date.today())
 
-    st.markdown("---")
-    st.markdown("### Usuarios existentes")
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute("select id, username, role, created_at from public.users order by id")
-            users = cur.fetchall()
+    params = {"desde": desde, "hasta": hasta}
+    where = ["m.fecha BETWEEN %(desde)s AND %(hasta)s"]
 
-    udf = pd.DataFrame(users) if users else pd.DataFrame()
-    st.dataframe(udf, use_container_width=True, hide_index=True)
+    if tipo != "(Todos)":
+        where.append("m.tipo = %(tipo)s")
+        params["tipo"] = tipo
+
+    if q.strip():
+        where.append("""
+            (
+                ma.id_maquina ILIKE %(q)s OR
+                ma.fabricante ILIKE %(q)s OR
+                ma.sector ILIKE %(q)s OR
+                ma.banco ILIKE %(q)s OR
+                m.descripcion ILIKE %(q)s OR
+                m.realizado_por ILIKE %(q)s
+            )
+        """)
+        params["q"] = f"%{q.strip()}%"
+
+    sql = f"""
+        SELECT
+            m.id,
+            m.fecha,
+            m.tipo,
+            ma.id_maquina,
+            ma.fabricante,
+            ma.sector,
+            ma.banco,
+            m.realizado_por,
+            m.descripcion,
+            m.created_at
+        FROM mantenciones m
+        JOIN machines ma ON ma.id_maquina = m.id_maquina
+        WHERE {" AND ".join(where)}
+        ORDER BY m.fecha DESC, m.id DESC
+        LIMIT 2000;
+    """
+
+    try:
+        rows = run_fetchall(sql, params)
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.caption(f"Mostrando {len(rows)} registros (máximo 2000).")
+    except Exception:
+        st.error("No se pudo cargar historial.")
+
+
+def page_usuarios_admin():
+    require_admin()
+
+    st.markdown('<div class="kr-card">', unsafe_allow_html=True)
+    st.markdown('<p class="kr-title">👤 Usuarios (Admin)</p>', unsafe_allow_html=True)
+    st.markdown('<p class="kr-sub">Crear usuarios, asignar admin, resetear claves.</p>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    tab1, tab2 = st.tabs(["📋 Usuarios", "➕ Crear / Reset"])
+
+    with tab1:
+        users = run_fetchall("""
+            SELECT id, username, is_admin, created_at
+            FROM users
+            ORDER BY is_admin DESC, username ASC;
+        """)
+        st.dataframe(users, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.write("Eliminar usuario (no recomendado si es único admin):")
+        usernames = [u["username"] for u in users]
+        if usernames:
+            u_sel = st.selectbox("Usuario", usernames)
+            if st.button("Eliminar usuario seleccionado", use_container_width=True):
+                if u_sel == current_user()["username"]:
+                    st.error("No puedes eliminar tu propio usuario logueado.")
+                else:
+                    try:
+                        run_exec("DELETE FROM users WHERE username=%s;", (u_sel,))
+                        st.success("Usuario eliminado.")
+                        st.rerun()
+                    except Exception:
+                        st.error("No se pudo eliminar el usuario.")
+
+    with tab2:
+        c1, c2, c3 = st.columns([2, 2, 1])
+        with c1:
+            new_user = st.text_input("Nuevo usuario", key="new_user")
+        with c2:
+            new_pass = st.text_input("Nueva contraseña", type="password", key="new_pass")
+        with c3:
+            new_is_admin = st.checkbox("Admin", value=False, key="new_is_admin")
+
+        if st.button("Crear usuario", use_container_width=True):
+            if not new_user.strip() or not new_pass:
+                st.error("Usuario y contraseña son obligatorios.")
+            else:
+                try:
+                    run_exec("""
+                        INSERT INTO users (username, password_hash, is_admin)
+                        VALUES (%s,%s,%s)
+                    """, (new_user.strip(), hash_password(new_pass), bool(new_is_admin)))
+                    st.success("Usuario creado.")
+                    st.rerun()
+                except Exception:
+                    st.error("No se pudo crear. ¿Usuario ya existe?")
+
+        st.divider()
+        st.write("Reset contraseña:")
+        users = run_fetchall("SELECT username FROM users ORDER BY username;")
+        if users:
+            u = st.selectbox("Usuario a resetear", [x["username"] for x in users], key="reset_user")
+            np = st.text_input("Nueva contraseña", type="password", key="reset_pass")
+            if st.button("Resetear contraseña", use_container_width=True):
+                if not np:
+                    st.error("Ingresa una nueva contraseña.")
+                else:
+                    try:
+                        run_exec("UPDATE users SET password_hash=%s WHERE username=%s;", (hash_password(np), u))
+                        st.success("Contraseña actualizada.")
+                    except Exception:
+                        st.error("No se pudo resetear la contraseña.")
+
+
+# ----------------------------
+# MAIN NAV
+# ----------------------------
+def render_sidebar_nav():
+    u = current_user()
+    st.sidebar.markdown("### KR_TGM")
+    st.sidebar.write(f"👋 **{u['username']}**")
+    st.sidebar.caption("Sistema Mantenciones • Streamlit + Supabase (Postgres)")
+
+    pages = ["🛠️ Mantenciones", "📚 Historial", "🎰 Máquinas"]
+    if u.get("is_admin"):
+        pages.append("👤 Usuarios (Admin)")
+    pages.append("🚪 Cerrar sesión")
+
+    choice = st.sidebar.radio("Navegación", pages, index=0)
+
+    if choice == "🚪 Cerrar sesión":
+        logout()
+        st.success("Sesión cerrada.")
+        st.rerun()
+
+    return choice
+
+
+def main():
+    if not is_logged_in():
+        render_login()
+        return
+
+    choice = render_sidebar_nav()
+
+    if choice == "🎰 Máquinas":
+        page_maquinas()
+    elif choice == "🛠️ Mantenciones":
+        page_mantenciones()
+    elif choice == "📚 Historial":
+        page_historial()
+    elif choice == "👤 Usuarios (Admin)":
+        page_usuarios_admin()
+    else:
+        page_mantenciones()
+
+
+if __name__ == "__main__":
+    main()
