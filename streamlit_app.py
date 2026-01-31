@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import datetime as dt
 
@@ -19,11 +20,11 @@ def get_db_url() -> str:
     env = os.getenv("DB_URL")
     if env:
         return env
-    raise KeyError("DB_URL no está definido en Secrets (ni env var).")
+    raise KeyError("DB_URL no está definido en Secrets (ni en variable de entorno).")
 
 
 def connect():
-    return psycopg.connect(get_db_url(), row_factory=dict_row, connect_timeout=8)
+    return psycopg.connect(get_db_url(), row_factory=dict_row, connect_timeout=10)
 
 
 def hash_password(plain: str) -> str:
@@ -56,28 +57,26 @@ def table_columns(schema: str, table: str) -> set[str]:
             return {r["column_name"] for r in cur.fetchall()}
 
 
-def safe_select(schema: str, table: str, wanted: list[str], search: str, search_cols: list[str], order_candidates: list[str]):
+def safe_select(schema: str, table: str, wanted: list[str], search: str,
+                search_cols: list[str], order_candidates: list[str]):
     cols = table_columns(schema, table)
 
-    # Selecciona solo columnas existentes
     select_cols = [c for c in wanted if c in cols]
     if not select_cols:
-        # fallback: muestra algo, sin reventar
-        select_cols = (["id"] if "id" in cols else []) + [c for c in sorted(cols) if c != "id"][:6]
+        # fallback: muestra algo sin romper
+        select_cols = (["id"] if "id" in cols else []) + [c for c in sorted(cols) if c != "id"][:8]
         if not select_cols:
             return [], [], cols
 
     q = f"select {', '.join(select_cols)} from {schema}.{table}"
     params = []
 
-    # Filtros solo por columnas existentes
     like_cols = [c for c in search_cols if c in cols]
     if search.strip() and like_cols:
         q += " where " + " or ".join([f"{c} ilike %s" for c in like_cols])
         s = f"%{search.strip()}%"
         params = [s] * len(like_cols)
 
-    # ORDER BY seguro
     order_by = next((c for c in order_candidates if c in cols), select_cols[0])
     q += f" order by {order_by}"
 
@@ -90,7 +89,7 @@ def safe_select(schema: str, table: str, wanted: list[str], search: str, search_
 
 
 # =========================
-# DB Setup (mínimo + no rompe si ya tienes tablas)
+# DB Setup (crea + agrega columnas clave)
 # =========================
 def db_prepare():
     with connect() as conn:
@@ -114,35 +113,58 @@ def db_prepare():
             );
             """)
 
-            # ===== columnas clave para tu operación =====
-            # OJO: "id_maquina" es tu ID operativo (ej: 32045), distinto del id bigserial interno
+            # columnas operativas principales
             cur.execute("alter table public.machines add column if not exists id_maquina text;")
             cur.execute("alter table public.machines add column if not exists fabricante text;")
             cur.execute("alter table public.machines add column if not exists sector text;")
             cur.execute("alter table public.machines add column if not exists banco text;")
 
-            # Opcionales
+            # opcionales
             cur.execute("alter table public.machines add column if not exists modelo text;")
             cur.execute("alter table public.machines add column if not exists serie text;")
             cur.execute("alter table public.machines add column if not exists estado text not null default 'activa';")
 
-            # índice único por id_maquina (si aplica)
+            # unique por id_maquina (si usas ese ID como clave)
             try:
                 cur.execute("create unique index if not exists machines_id_maquina_uidx on public.machines(id_maquina);")
             except Exception:
                 pass
 
+            # maintenance (mínimo)
+            cur.execute("""
+            create table if not exists public.maintenance (
+                id bigserial primary key,
+                created_at timestamptz not null default now()
+            );
+            """)
+
+            # columnas estándar de mantención
+            cur.execute("alter table public.maintenance add column if not exists id_maquina text;")
+            cur.execute("alter table public.maintenance add column if not exists tipo text not null default 'preventiva';")
+            cur.execute("alter table public.maintenance add column if not exists estado text not null default 'pendiente';")
+            cur.execute("alter table public.maintenance add column if not exists fecha_programada date;")
+            cur.execute("alter table public.maintenance add column if not exists fecha_ejecucion date;")
+            cur.execute("alter table public.maintenance add column if not exists tecnico text;")
+            cur.execute("alter table public.maintenance add column if not exists detalle text;")
+
         conn.commit()
 
     table_columns.clear()
 
-    # Limpia cache de columnas por si hubo cambios
-    table_columns.clear()
-
 
 # =========================
-# Auth DB ops
+# Auth ops
 # =========================
+def get_user_by_username(username: str):
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "select id, username, password_hash, role from public.users where username = %s",
+                (username.strip().lower(),),
+            )
+            return cur.fetchone()
+
+
 def create_user(username: str, plain_password: str, role: str):
     username = username.strip().lower()
     pwd_hash = hash_password(plain_password)
@@ -155,22 +177,7 @@ def create_user(username: str, plain_password: str, role: str):
         conn.commit()
 
 
-def get_user_by_username(username: str):
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "select id, username, password_hash, role from public.users where username = %s",
-                (username.strip().lower(),),
-            )
-            return cur.fetchone()
-
-
 def ensure_bootstrap_admin():
-    """
-    Bootstrap admin seguro:
-    - Crea si no existe
-    - Si BOOTSTRAP_FORCE=true, resetea password aunque ya exista
-    """
     admin_user = (st.secrets.get("BOOTSTRAP_ADMIN_USER") or "").strip().lower()
     admin_pass = st.secrets.get("BOOTSTRAP_ADMIN_PASS") or ""
     force = str(st.secrets.get("BOOTSTRAP_FORCE", "false")).lower() in ("1", "true", "yes")
@@ -203,7 +210,7 @@ def ensure_bootstrap_admin():
 
 
 # =========================
-# Machines ops (SAFE)
+# Machines ops
 # =========================
 def machines_list(search: str = ""):
     wanted = ["id_maquina", "fabricante", "sector", "banco", "modelo", "serie", "estado", "created_at"]
@@ -213,62 +220,65 @@ def machines_list(search: str = ""):
         wanted=wanted,
         search=search,
         search_cols=["id_maquina", "fabricante", "sector", "banco", "modelo"],
-        order_candidates=["id_maquina", "created_at"],
+        order_candidates=["id_maquina", "created_at", "id"],
     )
     return rows, shown, cols
 
-def machine_upsert(mcc: str, brand: str, model: str, serial: str, sector: str, status: str):
-    """
-    Upsert SOLO si existen las columnas. Si tu tabla no tiene esas columnas,
-    guardará únicamente lo que exista.
-    """
+
+def machine_get_by_id_maquina(id_maquina: str):
     cols = table_columns("public", "machines")
+    if "id_maquina" not in cols:
+        return None
 
-    # Asegura que exista mcc para poder hacer upsert por mcc.
-    # Si no existe, no podemos upsert; hacemos insert simple.
-    if "mcc" not in cols:
-        raise RuntimeError("La tabla public.machines no tiene columna 'mcc'. Agrega 'mcc' o dime tus nombres reales.")
+    wanted = ["id_maquina", "fabricante", "sector", "banco", "modelo", "serie", "estado", "created_at"]
+    select_cols = [c for c in wanted if c in cols]
+    q = f"select {', '.join(select_cols)} from public.machines where id_maquina = %s"
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (id_maquina,))
+            return cur.fetchone()
 
-    # Asegura índice unique para ON CONFLICT (si no existe, lo crea best-effort)
+
+def machine_upsert(id_maquina: str, fabricante: str, sector: str, banco: str, modelo: str, serie: str, estado: str):
+    cols = table_columns("public", "machines")
+    if "id_maquina" not in cols:
+        raise RuntimeError("La tabla public.machines no tiene columna 'id_maquina'.")
+
+    # asegura unique index
     with connect() as conn:
         with conn.cursor() as cur:
             try:
-                cur.execute("create unique index if not exists machines_mcc_uidx on public.machines(mcc);")
+                cur.execute("create unique index if not exists machines_id_maquina_uidx on public.machines(id_maquina);")
             except Exception:
                 pass
         conn.commit()
 
     data = {
-        "mcc": mcc,
-        "brand": brand,
-        "model": model,
-        "serial": serial,
+        "id_maquina": id_maquina,
+        "fabricante": fabricante,
         "sector": sector,
-        "status": status,
+        "banco": banco,
+        "modelo": modelo,
+        "serie": serie,
+        "estado": estado,
     }
 
-    # Filtra columnas que existan realmente
     insert_cols = [k for k in data.keys() if k in cols]
-    if not insert_cols:
-        raise RuntimeError("No hay columnas compatibles para guardar en public.machines (revisa esquema).")
-
     insert_vals = [data[k] for k in insert_cols]
-
-    set_cols = [c for c in insert_cols if c != "mcc"]
+    set_cols = [c for c in insert_cols if c != "id_maquina"]
     set_clause = ", ".join([f"{c}=excluded.{c}" for c in set_cols]) if set_cols else ""
 
     q = f"""
         insert into public.machines ({", ".join(insert_cols)})
         values ({", ".join(["%s"] * len(insert_cols))})
-        on conflict (mcc) do update
+        on conflict (id_maquina) do update
         set {set_clause}
     """
-    # Si no hay nada para actualizar, hacemos DO NOTHING
     if not set_cols:
         q = f"""
             insert into public.machines ({", ".join(insert_cols)})
             values ({", ".join(["%s"] * len(insert_cols))})
-            on conflict (mcc) do nothing
+            on conflict (id_maquina) do nothing
         """
 
     with connect() as conn:
@@ -277,30 +287,12 @@ def machine_upsert(mcc: str, brand: str, model: str, serial: str, sector: str, s
         conn.commit()
 
 
-def machine_get_by_mcc(mcc: str):
-    cols = table_columns("public", "machines")
-    if "mcc" not in cols:
-        return None
-
-    wanted = ["id", "mcc", "brand", "model", "serial", "sector", "status", "created_at"]
-    select_cols = [c for c in wanted if c in cols]
-    if not select_cols:
-        select_cols = ["mcc"]  # mínimo
-
-    q = f"select {', '.join(select_cols)} from public.machines where mcc = %s"
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(q, (mcc,))
-            return cur.fetchone()
-
-
 # =========================
-# Maintenance ops (SAFE)
+# Maintenance ops
 # =========================
-def maintenance_list(status_filter: str = "todas", search_mcc: str = ""):
+def maintenance_list(status_filter: str = "todas", search_id: str = ""):
     cols = table_columns("public", "maintenance")
-
-    wanted = ["id", "machine_id", "mcc", "type", "status", "scheduled_date", "executed_date", "technician", "detail", "created_at"]
+    wanted = ["id", "id_maquina", "tipo", "estado", "fecha_programada", "fecha_ejecucion", "tecnico", "detalle", "created_at"]
     select_cols = [c for c in wanted if c in cols]
     if not select_cols:
         select_cols = (["id"] if "id" in cols else []) + [c for c in sorted(cols) if c != "id"][:8]
@@ -308,13 +300,13 @@ def maintenance_list(status_filter: str = "todas", search_mcc: str = ""):
     q = f"select {', '.join(select_cols)} from public.maintenance where 1=1"
     params = []
 
-    if status_filter != "todas" and "status" in cols:
-        q += " and status = %s"
+    if status_filter != "todas" and "estado" in cols:
+        q += " and estado = %s"
         params.append(status_filter)
 
-    if search_mcc.strip() and "mcc" in cols:
-        q += " and mcc ilike %s"
-        params.append(f"%{search_mcc.strip()}%")
+    if search_id.strip() and "id_maquina" in cols:
+        q += " and id_maquina ilike %s"
+        params.append(f"%{search_id.strip()}%")
 
     order_by = "created_at" if "created_at" in cols else ("id" if "id" in cols else select_cols[0])
     q += f" order by {order_by} desc"
@@ -325,29 +317,24 @@ def maintenance_list(status_filter: str = "todas", search_mcc: str = ""):
             return cur.fetchall(), select_cols, cols
 
 
-def maintenance_create(mcc: str, mtype: str, status: str, scheduled_date, executed_date, technician: str, detail: str):
+def maintenance_create(id_maquina: str, tipo: str, estado: str, fecha_programada, fecha_ejecucion, tecnico: str, detalle: str):
     cols = table_columns("public", "maintenance")
-
     data = {
-        "mcc": mcc,
-        "type": mtype,
-        "status": status,
-        "scheduled_date": scheduled_date,
-        "executed_date": executed_date,
-        "technician": technician,
-        "detail": detail,
+        "id_maquina": id_maquina,
+        "tipo": tipo,
+        "estado": estado,
+        "fecha_programada": fecha_programada,
+        "fecha_ejecucion": fecha_ejecucion,
+        "tecnico": tecnico,
+        "detalle": detalle,
     }
 
     insert_cols = [k for k in data.keys() if k in cols]
     if not insert_cols:
         raise RuntimeError("La tabla public.maintenance no tiene columnas compatibles para insertar.")
-
     insert_vals = [data[k] for k in insert_cols]
 
-    q = f"""
-        insert into public.maintenance ({", ".join(insert_cols)})
-        values ({", ".join(["%s"] * len(insert_cols))})
-    """
+    q = f"insert into public.maintenance ({', '.join(insert_cols)}) values ({', '.join(['%s'] * len(insert_cols))})"
 
     with connect() as conn:
         with conn.cursor() as cur:
@@ -371,7 +358,7 @@ except Exception as e:
 
 
 # =========================
-# Auth
+# Session helpers
 # =========================
 def logout():
     for k in ["auth", "user_id", "username", "role"]:
@@ -379,6 +366,9 @@ def logout():
     st.rerun()
 
 
+# =========================
+# Sidebar
+# =========================
 with st.sidebar:
     st.subheader("Sesión")
     if st.session_state.get("auth"):
@@ -390,11 +380,10 @@ with st.sidebar:
 
 
 # =========================
-# Login Screen
+# Login
 # =========================
 if not st.session_state.get("auth"):
     st.subheader("Iniciar sesión")
-
     username = st.text_input("Usuario", placeholder="cristian").strip().lower()
     password = st.text_input("Contraseña", type="password")
 
@@ -419,22 +408,30 @@ if not st.session_state.get("auth"):
 # =========================
 role = st.session_state.get("role", "read")
 
-pages = ["🎰 Máquinas", "🛠 Mantenciones", "📜 Historial"]
+# Claves ASCII (sin emojis) para evitar problemas de encoding/sintaxis
+MENU = [
+    ("machines", "🎰 Máquinas"),
+    ("maintenance", "🛠 Mantenciones"),
+    ("history", "📜 Historial"),
+]
 if role == "admin":
-    pages.append("⚙️ Administración")
+    MENU.append(("admin", "⚙️ Administración"))
 
-page = st.sidebar.radio("Menú", pages)
+label_by_key = {k: v for k, v in MENU}
+keys = [k for k, _ in MENU]
+labels = [v for _, v in MENU]
 
+choice_label = st.sidebar.radio("Menú", labels)
+page = next(k for k, v in MENU if v == choice_label)
 
 # ---- Máquinas
-if page == "🎰 Máquinas":
+if page == "machines":
     st.subheader("Máquinas")
 
-    search = st.text_input("Buscar", placeholder="MCC, sector, marca, modelo...")
+    search = st.text_input("Buscar", placeholder="ID máquina, fabricante, sector, banco, modelo...")
 
     rows, shown, cols = machines_list(search)
     df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=shown)
-
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     if role == "admin":
@@ -443,52 +440,48 @@ if page == "🎰 Máquinas":
             st.write("Columnas mostradas:", shown)
 
     st.markdown("---")
-    st.markdown("### Crear / Editar (por MCC)")
+    st.markdown("### Crear / Editar máquina (por ID Máquina)")
     can_edit = role in ("admin", "supervisor")
     if not can_edit:
         st.info("Tu rol no permite editar máquinas.")
     else:
-        mcc = st.text_input("MCC").strip()
-        if st.button("Cargar datos por MCC"):
-            if mcc:
-                m = machine_get_by_mcc(mcc)
-                st.session_state["m_form"] = m if m else {"mcc": mcc}
+        idq = st.text_input("ID Máquina (ej: 32045)").strip()
+        current = machine_get_by_id_maquina(idq) if idq else {}
 
-        m_form = st.session_state.get("m_form", {"mcc": ""})
-        mcc2 = st.text_input("MCC (form)", value=m_form.get("mcc", "") or "", key="mcc_form").strip()
+        fabricante = st.text_input("Fabricante", value=(current.get("fabricante") or "") if current else "")
+        sector = st.text_input("Sector", value=(current.get("sector") or "") if current else "")
+        banco = st.text_input("Banco", value=(current.get("banco") or "") if current else "")
+        modelo = st.text_input("Modelo", value=(current.get("modelo") or "") if current else "")
+        serie = st.text_input("Serie", value=(current.get("serie") or "") if current else "")
 
-        # Campos opcionales: se guardan solo si existen en tu tabla
-        brand = st.text_input("Marca (si existe)", value=m_form.get("brand", "") or "")
-        model = st.text_input("Modelo (si existe)", value=m_form.get("model", "") or "")
-        serial = st.text_input("Serie (si existe)", value=m_form.get("serial", "") or "")
-        sector = st.text_input("Sector (si existe)", value=m_form.get("sector", "") or "")
-        status = st.text_input("Status (si existe)", value=m_form.get("status", "") or "activa")
+        estado_opts = ["activa", "fuera_servicio", "baja"]
+        current_estado = (current.get("estado") or "activa") if current else "activa"
+        idx = estado_opts.index(current_estado) if current_estado in estado_opts else 0
+        estado = st.selectbox("Estado", estado_opts, index=idx)
 
         if st.button("Guardar máquina", use_container_width=True):
-            if not mcc2:
-                st.error("MCC es obligatorio.")
+            if not idq:
+                st.error("ID Máquina es obligatorio.")
             else:
                 try:
-                    machine_upsert(mcc2, brand, model, serial, sector, status)
-                    st.success("Guardado.")
-                    st.session_state.pop("m_form", None)
+                    machine_upsert(idq, fabricante, sector, banco, modelo, serie, estado)
                     table_columns.clear()
+                    st.success("Guardado.")
                     st.rerun()
                 except Exception as e:
                     st.error(f"No se pudo guardar: {type(e).__name__}: {e}")
 
-
 # ---- Mantenciones
-elif page == "🛠 Mantenciones":
+elif page == "maintenance":
     st.subheader("Mantenciones")
 
-    colf1, colf2 = st.columns([1, 1])
-    with colf1:
+    col1, col2 = st.columns([1, 1])
+    with col1:
         status_filter = st.selectbox("Estado", ["todas", "pendiente", "en_proceso", "realizada", "cancelada"])
-    with colf2:
-        search_mcc = st.text_input("Filtrar por MCC", placeholder="10.123 / 32045 / etc...")
+    with col2:
+        search_id = st.text_input("Filtrar por ID Máquina", placeholder="32045 / 10.123 / etc...")
 
-    mrows, shown, cols = maintenance_list(status_filter=status_filter, search_mcc=search_mcc)
+    mrows, shown, cols = maintenance_list(status_filter=status_filter, search_id=search_id)
     mdf = pd.DataFrame(mrows) if mrows else pd.DataFrame(columns=shown)
     st.dataframe(mdf, use_container_width=True, hide_index=True)
 
@@ -498,68 +491,43 @@ elif page == "🛠 Mantenciones":
             st.write("Columnas mostradas:", shown)
 
     st.markdown("---")
-st.markdown("### Crear / Editar máquina (por ID Máquina)")
-can_edit = role in ("admin", "supervisor")
-if not can_edit:
-    st.info("Tu rol no permite editar máquinas.")
-else:
-    cols = table_columns("public", "machines")
+    st.markdown("### Crear mantención")
+    can_write = role in ("admin", "supervisor", "tecnico")
+    if not can_write:
+        st.info("Tu rol no permite registrar mantenciones.")
+    else:
+        id_maquina = st.text_input("ID Máquina", key="mt_id").strip()
+        tipo = st.selectbox("Tipo", ["preventiva", "correctiva", "upgrade", "inspeccion"], index=0)
+        estado = st.selectbox("Estado", ["pendiente", "en_proceso", "realizada", "cancelada"], index=0)
+        fecha_prog = st.date_input("Fecha programada", value=dt.date.today())
 
-    idq = st.text_input("ID Máquina (ej: 32045)").strip()
+        # opcional: permitir vacío
+        fecha_ejec = st.date_input("Fecha ejecución", value=None)
 
-    # Cargar por id_maquina si existe columna
-    current = {}
-    if idq and "id_maquina" in cols:
-        with connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("select * from public.machines where id_maquina = %s", (idq,))
-                current = cur.fetchone() or {}
+        tecnico = st.text_input("Técnico", value=st.session_state.get("username", ""))
+        detalle = st.text_area("Detalle", height=120)
 
-    fabricante = st.text_input("Fabricante", value=current.get("fabricante", "") or "")
-    sector = st.text_input("Sector", value=current.get("sector", "") or "")
-    banco = st.text_input("Banco", value=current.get("banco", "") or "")
-    modelo = st.text_input("Modelo", value=current.get("modelo", "") or "")
-    serie = st.text_input("Serie", value=current.get("serie", "") or "")
-    estado = st.selectbox("Estado", ["activa", "fuera_servicio", "baja"],
-                          index=["activa","fuera_servicio","baja"].index((current.get("estado") or "activa")))
-
-    if st.button("Guardar", use_container_width=True):
-        if not idq:
-            st.error("ID Máquina es obligatorio.")
-        else:
-            # Inserta/actualiza según columna id_maquina
-            with connect() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("create unique index if not exists machines_id_maquina_uidx on public.machines(id_maquina);")
-                    cur.execute("""
-                        insert into public.machines (id_maquina, fabricante, sector, banco, modelo, serie, estado)
-                        values (%s,%s,%s,%s,%s,%s,%s)
-                        on conflict (id_maquina) do update
-                        set fabricante=excluded.fabricante,
-                            sector=excluded.sector,
-                            banco=excluded.banco,
-                            modelo=excluded.modelo,
-                            serie=excluded.serie,
-                            estado=excluded.estado
-                    """, (idq, fabricante, sector, banco, modelo, serie, estado))
-                conn.commit()
-
-            table_columns.clear()
-            st.success("Guardado.")
-            st.rerun()
+        if st.button("Guardar mantención", use_container_width=True):
+            if not id_maquina:
+                st.error("ID Máquina es obligatorio.")
+            else:
+                try:
+                    maintenance_create(id_maquina, tipo, estado, fecha_prog, fecha_ejec, tecnico, detalle)
+                    table_columns.clear()
+                    st.success("Mantención registrada.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo guardar: {type(e).__name__}: {e}")
 
 # ---- Historial
-elif page == "📜 Historial":
+elif page == "history":
     st.subheader("Historial")
-
-    # reutiliza mantenimiento (últimos registros)
-    mrows, shown, _ = maintenance_list(status_filter="todas", search_mcc="")
+    mrows, shown, _ = maintenance_list(status_filter="todas", search_id="")
     hdf = pd.DataFrame(mrows) if mrows else pd.DataFrame(columns=shown)
-    st.dataframe(hdf.head(200), use_container_width=True, hide_index=True)
+    st.dataframe(hdf.head(300), use_container_width=True, hide_index=True)
 
-
-# ---- Administración (solo admin)
-elif page == "⚙️ Administración":
+# ---- Administración
+elif page == "admin":
     st.subheader("Administración • Usuarios (solo admin)")
 
     st.markdown("### Crear usuario")
