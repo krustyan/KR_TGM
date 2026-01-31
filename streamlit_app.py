@@ -557,25 +557,22 @@ def page_usuarios_admin():
 # ----------------------------
 # MAIN NAV
 # ----------------------------
-def render_sidebar_nav():
-    u = current_user()
-    st.sidebar.markdown("### KR_TGM")
-    st.sidebar.write(f"👋 **{u['username']}**")
-    st.sidebar.caption("Sistema Mantenciones • Streamlit + Supabase (Postgres)")
+choice = render_sidebar_nav()
 
-    pages = ["🛠️ Mantenciones", "📚 Historial", "🎰 Máquinas"]
-    if u.get("is_admin"):
-        pages.append("👤 Usuarios (Admin)")
-    pages.append("🚪 Cerrar sesión")
+if choice == "🎰 Máquinas":
+    page_maquinas()
 
-    choice = st.sidebar.radio("Navegación", pages, index=0)
+elif choice == "🛠️ Mantenciones":
+    page_mantenciones()
 
-    if choice == "🚪 Cerrar sesión":
-        logout()
-        st.success("Sesión cerrada.")
-        st.rerun()
+elif choice == "📚 Historial":
+    page_historial()
 
-    return choice
+elif choice == "👤 Usuarios (Admin)":
+    page_usuarios_admin()
+
+else:
+    page_mantenciones()
 
 
 def main():
