@@ -1,5 +1,4 @@
 import os
-import re
 import hmac
 import hashlib
 import binascii
@@ -51,7 +50,6 @@ DB_URL = get_db_url()
 # DB CONNECTION (psycopg v3)
 # ----------------------------
 def db_conn():
-    # Supabase generalmente requiere SSL
     return psycopg.connect(DB_URL, sslmode="require", row_factory=dict_row)
 
 
@@ -97,24 +95,60 @@ def verify_password(password: str, stored: str) -> bool:
 
 
 # ----------------------------
-# INIT DB
+# SCHEMA HELPERS
 # ----------------------------
+def column_exists(table: str, column: str) -> bool:
+    row = run_fetchone(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = %s
+          AND column_name = %s
+        LIMIT 1;
+        """,
+        (table, column),
+    )
+    return bool(row)
+
+
+def ensure_users_schema():
+    """
+    Si 'users' ya existe pero le faltan columnas, las agrega.
+    Evita el error 'is_admin does not exist'.
+    """
+    # Si la tabla no existe, la creamos limpia
+    run_exec("""
+    CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """)
+
+    # Si existe pero faltan columnas, las agregamos sin destruir datos
+    if not column_exists("users", "password_hash"):
+        run_exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;")
+
+    if not column_exists("users", "is_admin"):
+        run_exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;")
+
+    if not column_exists("users", "created_at"):
+        run_exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
+
+    # Si algunos usuarios antiguos tenían password en otra columna (por ejemplo 'password'),
+    # aquí podrías migrar manualmente. Por ahora solo garantizamos que exista password_hash.
+
+
 def init_db():
     """
     Crea tablas si no existen.
-    IMPORTANTE: id_maquina se define como INTEGER para coincidir con tu DB actual.
-    Si ya existen tablas, esto no las altera (IF NOT EXISTS).
+    id_maquina se define como INTEGER para coincidir con tu DB actual.
     """
     try:
-        run_exec("""
-        CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            is_admin BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        """)
+        ensure_users_schema()
 
         run_exec("""
         CREATE TABLE IF NOT EXISTS machines (
@@ -143,16 +177,21 @@ def init_db():
         );
         """)
 
-        # Seed admin si no existe ninguno
+        # Seed admin (si no existe ningún admin)
+        # OJO: ahora is_admin siempre existe (porque ensure_users_schema lo asegura)
         existing_admin = run_fetchone("SELECT id FROM users WHERE is_admin = TRUE LIMIT 1;")
         if not existing_admin:
             run_exec(
-                "INSERT INTO users (username, password_hash, is_admin) VALUES (%s,%s,TRUE) ON CONFLICT (username) DO NOTHING;",
-                ("admin", hash_password("Admin1234!"))
+                """
+                INSERT INTO users (username, password_hash, is_admin)
+                VALUES (%s,%s,TRUE)
+                ON CONFLICT (username) DO NOTHING;
+                """,
+                ("admin", hash_password("Admin1234!")),
             )
 
     except Exception as e:
-        st.warning("No pude ejecutar CREATE TABLE. Si las tablas ya existen, puedes ignorarlo. Detalle:")
+        st.warning("No pude ejecutar inicialización completa (CREATE/ALTER). Si las tablas ya existen, puedes ignorarlo. Detalle:")
         st.exception(e)
 
 
@@ -186,13 +225,15 @@ def require_admin():
 def login(username: str, password: str) -> bool:
     user = run_fetchone(
         "SELECT id, username, password_hash, is_admin FROM users WHERE username = %s;",
-        (username,)
+        (username.strip(),),
     )
     if not user:
         return False
+    if not user.get("password_hash"):
+        return False
     if not verify_password(password, user["password_hash"]):
         return False
-    st.session_state["user"] = {"id": user["id"], "username": user["username"], "is_admin": user["is_admin"]}
+    st.session_state["user"] = {"id": user["id"], "username": user["username"], "is_admin": bool(user["is_admin"])}
     return True
 
 
@@ -212,7 +253,7 @@ def get_all_machines():
 
 
 def machine_exists(id_maquina: int) -> bool:
-    row = run_fetchone("SELECT id_maquina FROM machines WHERE id_maquina = %s;", (id_maquina,))
+    row = run_fetchone("SELECT id_maquina FROM machines WHERE id_maquina = %s;", (int(id_maquina),))
     return bool(row)
 
 
@@ -243,12 +284,12 @@ def render_login():
             if not username or not password:
                 st.error("Completa usuario y contraseña.")
             else:
-                ok = login(username.strip(), password)
+                ok = login(username, password)
                 if ok:
                     st.success("Sesión iniciada.")
                     st.rerun()
                 else:
-                    st.error("Usuario o contraseña incorrectos.")
+                    st.error("Usuario o contraseña incorrectos (o usuario sin password_hash).")
 
     st.info("Si es primera vez: usuario **admin** / clave **Admin1234!** (cámbiala apenas entres).")
     st.markdown("</div>", unsafe_allow_html=True)
@@ -376,14 +417,13 @@ def page_mantenciones():
     with c4:
         realizado_por = st.text_input("Realizado por", value=current_user()["username"])
 
-    descripcion = st.text_area("Descripción", height=120, placeholder="Detalle de la mantención, falla, acción realizada, repuestos, etc.")
+    descripcion = st.text_area("Descripción", height=120)
 
     if st.button("Guardar mantención", use_container_width=True):
         if not descripcion.strip():
             st.error("La descripción es obligatoria.")
             return
 
-        # Validación: no guardar si no existe máquina
         if not machine_exists(id_maquina):
             st.error("No se puede guardar: la máquina seleccionada ya no existe.")
             return
@@ -484,23 +524,6 @@ def page_usuarios_admin():
         """)
         st.dataframe(users, use_container_width=True, hide_index=True)
 
-        st.divider()
-        st.write("Eliminar usuario:")
-        usernames = [u["username"] for u in users]
-        if usernames:
-            u_sel = st.selectbox("Usuario", usernames)
-            if st.button("Eliminar usuario seleccionado", use_container_width=True):
-                if u_sel == current_user()["username"]:
-                    st.error("No puedes eliminar tu propio usuario logueado.")
-                else:
-                    try:
-                        run_exec("DELETE FROM users WHERE username=%s;", (u_sel,))
-                        st.success("Usuario eliminado.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error("No se pudo eliminar el usuario.")
-                        st.exception(e)
-
     with tab2:
         c1, c2, c3 = st.columns([2, 2, 1])
         with c1:
@@ -513,34 +536,17 @@ def page_usuarios_admin():
         if st.button("Crear usuario", use_container_width=True):
             if not new_user.strip() or not new_pass:
                 st.error("Usuario y contraseña son obligatorios.")
-            else:
-                try:
-                    run_exec("""
-                        INSERT INTO users (username, password_hash, is_admin)
-                        VALUES (%s,%s,%s)
-                    """, (new_user.strip(), hash_password(new_pass), bool(new_is_admin)))
-                    st.success("Usuario creado.")
-                    st.rerun()
-                except Exception as e:
-                    st.error("No se pudo crear. ¿Usuario ya existe?")
-                    st.exception(e)
-
-        st.divider()
-        st.write("Reset contraseña:")
-        users = run_fetchall("SELECT username FROM users ORDER BY username;")
-        if users:
-            u = st.selectbox("Usuario a resetear", [x["username"] for x in users], key="reset_user")
-            np = st.text_input("Nueva contraseña", type="password", key="reset_pass")
-            if st.button("Resetear contraseña", use_container_width=True):
-                if not np:
-                    st.error("Ingresa una nueva contraseña.")
-                else:
-                    try:
-                        run_exec("UPDATE users SET password_hash=%s WHERE username=%s;", (hash_password(np), u))
-                        st.success("Contraseña actualizada.")
-                    except Exception as e:
-                        st.error("No se pudo resetear la contraseña.")
-                        st.exception(e)
+                return
+            try:
+                run_exec("""
+                    INSERT INTO users (username, password_hash, is_admin)
+                    VALUES (%s,%s,%s)
+                """, (new_user.strip(), hash_password(new_pass), bool(new_is_admin)))
+                st.success("Usuario creado.")
+                st.rerun()
+            except Exception as e:
+                st.error("No se pudo crear. ¿Usuario ya existe?")
+                st.exception(e)
 
 
 # ----------------------------
