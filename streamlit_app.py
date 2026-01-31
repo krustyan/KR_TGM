@@ -51,8 +51,7 @@ DB_URL = get_db_url()
 # DB CONNECTION (psycopg v3)
 # ----------------------------
 def db_conn():
-    # Supabase normalmente requiere SSL
-    # psycopg3 permite pasar sslmode="require"
+    # Supabase generalmente requiere SSL
     return psycopg.connect(DB_URL, sslmode="require", row_factory=dict_row)
 
 
@@ -98,13 +97,13 @@ def verify_password(password: str, stored: str) -> bool:
 
 
 # ----------------------------
-# INIT DB (CREATE TABLES)
+# INIT DB
 # ----------------------------
 def init_db():
     """
     Crea tablas si no existen.
-    Si tu usuario no tiene permisos CREATE en Supabase, mostrará warning y seguirá,
-    asumiendo que las tablas ya existen.
+    IMPORTANTE: id_maquina se define como INTEGER para coincidir con tu DB actual.
+    Si ya existen tablas, esto no las altera (IF NOT EXISTS).
     """
     try:
         run_exec("""
@@ -119,7 +118,7 @@ def init_db():
 
         run_exec("""
         CREATE TABLE IF NOT EXISTS machines (
-            id_maquina TEXT PRIMARY KEY,
+            id_maquina INTEGER PRIMARY KEY,
             fabricante TEXT NOT NULL,
             sector TEXT NOT NULL,
             banco TEXT NOT NULL,
@@ -130,7 +129,7 @@ def init_db():
         run_exec("""
         CREATE TABLE IF NOT EXISTS mantenciones (
             id SERIAL PRIMARY KEY,
-            id_maquina TEXT NOT NULL,
+            id_maquina INTEGER NOT NULL,
             tipo TEXT NOT NULL,
             descripcion TEXT NOT NULL,
             fecha DATE NOT NULL,
@@ -157,7 +156,6 @@ def init_db():
         st.exception(e)
 
 
-# Ejecuta init al iniciar
 init_db()
 
 
@@ -205,12 +203,6 @@ def logout():
 # ----------------------------
 # HELPERS
 # ----------------------------
-def sanitize_machine_id(mid: str) -> str:
-    mid = (mid or "").strip()
-    mid = re.sub(r"[^A-Za-z0-9._-]", "", mid)
-    return mid
-
-
 def get_all_machines():
     return run_fetchall("""
         SELECT id_maquina, fabricante, sector, banco
@@ -219,9 +211,16 @@ def get_all_machines():
     """)
 
 
-def machine_exists(id_maquina: str) -> bool:
+def machine_exists(id_maquina: int) -> bool:
     row = run_fetchone("SELECT id_maquina FROM machines WHERE id_maquina = %s;", (id_maquina,))
     return bool(row)
+
+
+def safe_int(value, default=None):
+    try:
+        return int(value)
+    except Exception:
+        return default
 
 
 # ----------------------------
@@ -263,7 +262,7 @@ def page_maquinas():
 
     st.markdown('<div class="kr-card">', unsafe_allow_html=True)
     st.markdown('<p class="kr-title">🎰 Máquinas</p>', unsafe_allow_html=True)
-    st.markdown('<p class="kr-sub">Gestiona id_maquina, fabricante, sector y banco.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="kr-sub">Gestiona id_maquina (numérico), fabricante, sector y banco.</p>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     tab1, tab2 = st.tabs(["📋 Listado / Editar", "➕ Crear"])
@@ -281,7 +280,7 @@ def page_maquinas():
 
         colA, colB, colC, colD = st.columns(4)
         with colA:
-            st.text_input("id_maquina (PK)", value=m["id_maquina"], disabled=True)
+            st.number_input("id_maquina (PK)", value=int(m["id_maquina"]), step=1, disabled=True)
         with colB:
             fabricante = st.text_input("fabricante", value=m["fabricante"])
         with colC:
@@ -297,7 +296,7 @@ def page_maquinas():
                         UPDATE machines
                         SET fabricante=%s, sector=%s, banco=%s
                         WHERE id_maquina=%s
-                    """, (fabricante.strip(), sector.strip(), banco.strip(), m["id_maquina"]))
+                    """, (fabricante.strip(), sector.strip(), banco.strip(), int(m["id_maquina"])))
                     st.success("Máquina actualizada.")
                     st.rerun()
                 except Exception as e:
@@ -307,7 +306,7 @@ def page_maquinas():
         with c2:
             if st.button("Eliminar máquina", use_container_width=True):
                 try:
-                    run_exec("DELETE FROM machines WHERE id_maquina=%s;", (m["id_maquina"],))
+                    run_exec("DELETE FROM machines WHERE id_maquina=%s;", (int(m["id_maquina"]),))
                     st.success("Máquina eliminada.")
                     st.rerun()
                 except Exception as e:
@@ -323,7 +322,7 @@ def page_maquinas():
     with tab2:
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            new_id = st.text_input("Nuevo id_maquina")
+            new_id = st.number_input("Nuevo id_maquina", step=1)
         with col2:
             new_fab = st.text_input("fabricante", placeholder="IGT / Novomatic / etc.")
         with col3:
@@ -332,20 +331,21 @@ def page_maquinas():
             new_banco = st.text_input("banco", placeholder="Ej: Banco A / King Kong Cash")
 
         if st.button("Crear máquina", use_container_width=True):
-            nid = sanitize_machine_id(new_id)
-            if not nid or not new_fab or not new_sector or not new_banco:
+            nid = safe_int(new_id)
+            if nid is None or not new_fab.strip() or not new_sector.strip() or not new_banco.strip():
                 st.error("Completa todos los campos.")
-            else:
-                try:
-                    run_exec("""
-                        INSERT INTO machines (id_maquina, fabricante, sector, banco)
-                        VALUES (%s,%s,%s,%s)
-                    """, (nid, new_fab.strip(), new_sector.strip(), new_banco.strip()))
-                    st.success("Máquina creada.")
-                    st.rerun()
-                except Exception as e:
-                    st.error("No se pudo crear. ¿id_maquina ya existe?")
-                    st.exception(e)
+                return
+
+            try:
+                run_exec("""
+                    INSERT INTO machines (id_maquina, fabricante, sector, banco)
+                    VALUES (%s,%s,%s,%s)
+                """, (nid, new_fab.strip(), new_sector.strip(), new_banco.strip()))
+                st.success("Máquina creada.")
+                st.rerun()
+            except Exception as e:
+                st.error("No se pudo crear. ¿id_maquina ya existe?")
+                st.exception(e)
 
 
 def page_mantenciones():
@@ -368,7 +368,7 @@ def page_mantenciones():
     with c1:
         sel_label = st.selectbox("Máquina (buscable)", labels)
         sel_machine = idx_map[sel_label]
-        id_maquina = sel_machine["id_maquina"]
+        id_maquina = int(sel_machine["id_maquina"])
     with c2:
         fecha = st.date_input("Fecha", value=date.today())
     with c3:
@@ -428,7 +428,7 @@ def page_historial():
     if q.strip():
         where.append("""
             (
-                ma.id_maquina ILIKE %(q)s OR
+                ma.id_maquina::text ILIKE %(q)s OR
                 ma.fabricante ILIKE %(q)s OR
                 ma.sector ILIKE %(q)s OR
                 ma.banco ILIKE %(q)s OR
@@ -471,7 +471,7 @@ def page_usuarios_admin():
 
     st.markdown('<div class="kr-card">', unsafe_allow_html=True)
     st.markdown('<p class="kr-title">👤 Usuarios (Admin)</p>', unsafe_allow_html=True)
-    st.markdown('<p class="kr-sub">Crear usuarios, asignar admin, resetear claves.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="kr-sub">Crear usuarios, resetear claves.</p>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     tab1, tab2 = st.tabs(["📋 Usuarios", "➕ Crear / Reset"])
@@ -577,19 +577,14 @@ def main():
 
     choice = render_sidebar_nav()
 
-    # ✅ BLOQUE CORREGIDO (sin elif suelto)
     if choice == "🎰 Máquinas":
         page_maquinas()
-
     elif choice == "🛠️ Mantenciones":
         page_mantenciones()
-
     elif choice == "📚 Historial":
         page_historial()
-
     elif choice == "👤 Usuarios (Admin)":
         page_usuarios_admin()
-
     else:
         page_mantenciones()
 
